@@ -1,0 +1,100 @@
+[build-system]
+requires = ["setuptools>=84.2.1", "wheel>=0.48.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sqlalchemy-hardcharger"
+dynamic = ["version"]
+description = "SQLAlchemy dialect for Hardcharger, GizmoData's DuckDB 2.0 server"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.11"
+authors = [{ name = "Philip Moore", email = "philip@gizmodata.com" }]
+keywords = ["sqlalchemy", "dialect", "hardcharger", "duckdb", "adbc", "arrow", "chargewire"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Topic :: Database",
+    "Topic :: Database :: Front-Ends",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    # A dialect is installed into the application's environment, and applications pin
+    # SQLAlchemy's minor version (Great Expectations <2.1, SQLModel <2.2), so both current
+    # series are supported: the floor is the 2.0 series' latest release. CI's lowest-versions
+    # job installs exactly these floors.
+    "sqlalchemy>=2.0.57,<2.2",
+    "adbc-driver-hardcharger>=2.4.9,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "hardcharger>=2.12.0",
+    "pytest>=9.2.0",
+    "alembic>=1.20.1",
+    "pandas>=3.1.1",
+    "cryptography>=50.0.2",
+    "ruff>=0.17.5",
+    "mypy>=2.4.1",
+    "build>=1.6.1",
+    "twine>=7.0.0",
+]
+
+[project.entry-points."sqlalchemy.dialects"]
+hardcharger = "sqlalchemy_hardcharger:HardchargerDialect"
+"hardcharger.adbc" = "sqlalchemy_hardcharger:HardchargerDialect"
+
+[project.urls]
+Homepage = "https://gizmodata.com/hardcharger"
+Repository = "https://github.com/gizmodata/sqlalchemy-hardcharger"
+Documentation = "https://github.com/gizmodata/sqlalchemy-hardcharger#readme"
+Changelog = "https://github.com/gizmodata/sqlalchemy-hardcharger/blob/main/CHANGELOG.md"
+Issues = "https://github.com/gizmodata/sqlalchemy-hardcharger/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "sqlalchemy_hardcharger._version.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["sqlalchemy_hardcharger*"]
+
+[tool.setuptools.package-data]
+sqlalchemy_hardcharger = ["py.typed"]
+
+[tool.pytest.ini_options]
+# SQLAlchemy's own dialect suite (tests/sqlalchemy_suite) takes over pytest's collection, so it
+# runs as its own invocation: `pytest tests/sqlalchemy_suite`.
+testpaths = ["tests/unit", "tests/integration"]
+addopts = "-ra"
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# The dialect replaces PostgreSQL-specific members of SQLAlchemy's PGDialect (isolation levels,
+# the inspector, pg_catalog reflection) with DuckDB ones of other shapes.
+module = "sqlalchemy_hardcharger.dialect"
+disable_error_code = ["override", "assignment"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP"]
+# UP031: SQL text is assembled with % as SQLAlchemy's own compilers do.
+ignore = ["UP031"]
+
+[tool.ruff.lint.per-file-ignores]
+# SQLAlchemy's suite is run by importing it whole.
+"tests/sqlalchemy_suite/*" = ["F401", "F403", "F405"]
