@@ -80,12 +80,6 @@ python_version = "3.11"
 warn_unused_configs = true
 ignore_missing_imports = true
 
-[[tool.mypy.overrides]]
-# The dialect replaces PostgreSQL-specific members of SQLAlchemy's PGDialect (isolation levels,
-# the inspector, pg_catalog reflection) with DuckDB ones of other shapes.
-module = "sqlalchemy_hardcharger.dialect"
-disable_error_code = ["override", "assignment"]
-
 [tool.ruff]
 line-length = 100
 target-version = "py311"

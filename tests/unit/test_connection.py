@@ -132,6 +132,10 @@ def test_isolation_levels():
             True,
         ),
         (
+            'Parser Error: syntax error at or near "EOF" LINE 1: SELECT EOF (sql_error, HTTP 400)',
+            False,
+        ),
+        (
             "Catalog Error: Table with name t does not exist! (sql_error, HTTP 400, request r_1)",
             False,
         ),

@@ -69,10 +69,10 @@ _DISCONNECT_MARKERS = (
     "(invalid_token",
     "(server_draining",
     "connection refused",
-    "connection reset",
+    "connection reset by peer",
     "broken pipe",
     "no such host",
-    "EOF",
+    "unexpected EOF",
 )
 
 
@@ -227,7 +227,7 @@ def _serial_sequence(column: Any, schema_name: str | None) -> schema.Sequence | 
 
 
 class HardchargerIdentifierPreparer(PGIdentifierPreparer):
-    reserved_words = RESERVED_WORDS
+    reserved_words = RESERVED_WORDS  # type: ignore[assignment]
 
     def _separate(self, name: str) -> tuple[str | None, str]:
         """Split a schema name into (catalog, schema).
@@ -276,7 +276,7 @@ class HardchargerCompiler(PGCompiler):
         # at the write or at COMMIT), so SELECT ... FOR UPDATE has nothing to take.
         return ""
 
-    def visit_sequence(self, seq: Any, **kw: Any) -> str:
+    def visit_sequence(self, seq: Any, **kw: Any) -> str:  # type: ignore[override]
         return "nextval(%s)" % self.preparer.format_sequence_literal(sequence=seq)
 
     def visit_floordiv_binary(self, binary: Any, operator: Any, **kw: Any) -> str:
@@ -402,11 +402,11 @@ class HardchargerDDLCompiler(PGDDLCompiler):
             generated.sqltext, include_table=False, literal_binds=True
         )
 
-    def visit_create_sequence(self, create: Any, **kw: Any) -> str:
+    def visit_create_sequence(self, create: Any, **kw: Any) -> str:  # type: ignore[override]
         # DuckDB's CREATE SEQUENCE takes no "AS <type>" (PostgreSQL's does).
         return compiler.DDLCompiler.visit_create_sequence(self, create, **kw)
 
-    def visit_create_index(self, create: Any, **kw: Any) -> str:
+    def visit_create_index(self, create: Any, **kw: Any) -> str:  # type: ignore[override]
         # Plain CREATE [UNIQUE] INDEX: none of PostgreSQL's CONCURRENTLY/USING/INCLUDE/WHERE.
         return compiler.DDLCompiler.visit_create_index(self, create, **kw)
 
@@ -568,8 +568,8 @@ class HardchargerDialect(PGDialect):
     type_compiler_cls = HardchargerTypeCompiler
     preparer = HardchargerIdentifierPreparer
     identifier_preparer: HardchargerIdentifierPreparer
-    execution_ctx_cls = HardchargerExecutionContext
-    inspector = reflection.Inspector
+    execution_ctx_cls = HardchargerExecutionContext  # type: ignore[assignment]
+    inspector = reflection.Inspector  # type: ignore[assignment]
 
     # DuckDB identifiers have no length limit to speak of.
     max_identifier_length = 1024
@@ -612,7 +612,7 @@ class HardchargerDialect(PGDialect):
     _supports_jsonb_subscripting = False
 
     construct_arguments: list[Any] = []
-    reflection_options = ()
+    reflection_options = ()  # type: ignore[assignment]
 
     ischema_names = hctypes.ISCHEMA_NAMES
     colspecs = util.update_copy(
@@ -767,14 +767,28 @@ class HardchargerDialect(PGDialect):
 
     # -- transactions -------------------------------------------------------------------------
 
+    @staticmethod
+    def _wrapped(dbapi_connection: Any) -> HardchargerConnection:
+        # SQLAlchemy passes the pool's proxy here: the connection itself is behind it.
+        dbapi_connection = getattr(dbapi_connection, "dbapi_connection", dbapi_connection)
+        if not isinstance(dbapi_connection, HardchargerConnection):
+            # A driver connection handed in from outside (create_engine(creator=...)) is in
+            # autocommit and would run every "transaction" as separate commits.
+            raise exc.InvalidRequestError(
+                "the hardcharger dialect needs its own connection wrapper to run transactions: "
+                "have creator= return sqlalchemy_hardcharger.HardchargerConnection("
+                "driver_connection=<the adbc_driver_hardcharger connection>)"
+            )
+        return dbapi_connection
+
     def do_begin(self, dbapi_connection: Any) -> None:
-        dbapi_connection.begin()
+        self._wrapped(dbapi_connection=dbapi_connection).begin()
 
     def do_commit(self, dbapi_connection: Any) -> None:
-        dbapi_connection.commit()
+        self._wrapped(dbapi_connection=dbapi_connection).commit()
 
     def do_rollback(self, dbapi_connection: Any) -> None:
-        dbapi_connection.rollback()
+        self._wrapped(dbapi_connection=dbapi_connection).rollback()
 
     def do_savepoint(self, connection: Any, name: str) -> None:
         raise exc.InvalidRequestError(
@@ -782,13 +796,13 @@ class HardchargerDialect(PGDialect):
             "(Connection.begin_nested(), Session.begin_nested()) aren't available"
         )
 
-    def get_isolation_level_values(self, dbapi_connection: Any) -> tuple[str, ...]:
+    def get_isolation_level_values(self, dbapi_connection: Any) -> tuple[str, ...]:  # type: ignore[override]
         return ISOLATION_LEVELS
 
-    def get_default_isolation_level(self, dbapi_conn: Any) -> str:
+    def get_default_isolation_level(self, dbapi_conn: Any) -> str:  # type: ignore[override]
         return "SNAPSHOT"
 
-    def get_isolation_level(self, dbapi_connection: Any) -> str:
+    def get_isolation_level(self, dbapi_connection: Any) -> str:  # type: ignore[override]
         return "AUTOCOMMIT" if dbapi_connection.autocommit else "SNAPSHOT"
 
     def set_isolation_level(self, dbapi_connection: Any, level: str) -> None:
@@ -870,7 +884,7 @@ class HardchargerDialect(PGDialect):
         return names
 
     @reflection.cache
-    def has_schema(self, connection: Any, schema_name: str, **kw: Any) -> bool:
+    def has_schema(self, connection: Any, schema_name: str, **kw: Any) -> bool:  # type: ignore[override]
         where, params = self._scope(schema=schema_name)
         return (
             connection.execute(
@@ -1226,14 +1240,14 @@ class HardchargerDialect(PGDialect):
 
     # The multi-table reflection entry points go through the single-table ones above, not
     # through PostgreSQL's pg_catalog queries.
-    get_multi_columns = DefaultDialect.get_multi_columns
-    get_multi_pk_constraint = DefaultDialect.get_multi_pk_constraint
-    get_multi_foreign_keys = DefaultDialect.get_multi_foreign_keys
-    get_multi_indexes = DefaultDialect.get_multi_indexes
-    get_multi_unique_constraints = DefaultDialect.get_multi_unique_constraints
-    get_multi_check_constraints = DefaultDialect.get_multi_check_constraints
-    get_multi_table_comment = DefaultDialect.get_multi_table_comment
-    get_multi_table_options = DefaultDialect.get_multi_table_options
+    get_multi_columns = DefaultDialect.get_multi_columns  # type: ignore[assignment]
+    get_multi_pk_constraint = DefaultDialect.get_multi_pk_constraint  # type: ignore[assignment]
+    get_multi_foreign_keys = DefaultDialect.get_multi_foreign_keys  # type: ignore[assignment]
+    get_multi_indexes = DefaultDialect.get_multi_indexes  # type: ignore[assignment]
+    get_multi_unique_constraints = DefaultDialect.get_multi_unique_constraints  # type: ignore[assignment]
+    get_multi_check_constraints = DefaultDialect.get_multi_check_constraints  # type: ignore[assignment]
+    get_multi_table_comment = DefaultDialect.get_multi_table_comment  # type: ignore[assignment]
+    get_multi_table_options = DefaultDialect.get_multi_table_options  # type: ignore[assignment]
     # DuckDB tables have no storage options to reflect.
     get_table_options = DefaultDialect.get_table_options
     if hasattr(DefaultDialect, "has_multi_table"):

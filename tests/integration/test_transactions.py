@@ -100,6 +100,23 @@ def test_a_connection_that_ran_nothing_sends_nothing(engine, control_statements)
     assert control_statements == []
 
 
+def test_a_brand_new_connection_begins_nothing_until_its_first_statement(url, control_statements):
+    fresh = create_engine(url=url)
+    try:
+        with fresh.connect() as conn:  # the engine's first connection: it reads the version
+            assert control_statements == []
+            assert not conn.connection.dbapi_connection.in_transaction
+        fresh.dispose()
+        with fresh.connect() as conn:  # a second, newly opened one
+            assert control_statements == []
+            assert not conn.connection.dbapi_connection.in_transaction
+            conn.execute(text("SELECT 1"))
+            assert control_statements == ["BEGIN"]
+        assert control_statements == ["BEGIN", "ROLLBACK"]
+    finally:
+        fresh.dispose()
+
+
 def test_returning_to_the_pool_mid_transaction_rolls_back(engine, items, control_statements):
     with engine.connect() as conn:
         conn.execute(items.insert().values(id=1, v="a"))
@@ -209,3 +226,29 @@ def test_pool_pre_ping_replaces_a_killed_session(url):
     finally:
         engine.dispose()
         admin.dispose()
+
+
+def test_a_raw_driver_connection_from_a_creator_is_refused_with_the_fix(server, url):
+    from adbc_driver_hardcharger import dbapi
+
+    def raw():
+        return dbapi.connect(
+            uri=f"hardcharger://{server.host}:{server.port}?tls=false",
+            username=server.username,
+            password=server.password,
+        )
+
+    engine = create_engine(url=url, creator=raw)
+    try:
+        with pytest.raises(exc.InvalidRequestError, match="HardchargerConnection"):
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+    finally:
+        engine.dispose()
+
+    wrapped = create_engine(url=url, creator=lambda: HardchargerConnection(driver_connection=raw()))
+    try:
+        with wrapped.begin() as conn:
+            assert conn.execute(text("SELECT 1")).scalar() == 1
+    finally:
+        wrapped.dispose()

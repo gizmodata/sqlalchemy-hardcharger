@@ -23,6 +23,16 @@ PASSWORD = "sa-test-password"
 _names = itertools.count()
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]) -> Iterator[None]:
+    """A skipped integration test is a failed one: these tests exist to run against a server."""
+    outcome = yield
+    report = outcome.get_result()
+    if report.skipped:
+        report.outcome = "failed"
+        report.longrepr = f"integration tests never skip, but this one did: {report.longrepr}"
+
+
 def server_url(server: hardcharger.Server, **query: str) -> URL:
     """The SQLAlchemy URL of a test server, with extra URL options."""
     if not server.tls:
