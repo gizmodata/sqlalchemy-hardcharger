@@ -122,6 +122,17 @@ jobs:
           uv pip install -e ".[dev]" "sqlalchemy==${{ matrix.sqlalchemy }}.*"
           .venv/bin/python -c 'import sys, sqlalchemy; print(sys.version); print("SQLAlchemy", sqlalchemy.__version__)'
           .venv/bin/python -c 'import sqlalchemy, sys; sys.exit(not sqlalchemy.__version__.startswith("${{ matrix.sqlalchemy }}."))'
+      # The server binary comes from GitHub's release downloads, which answer 5xx now and then
+      # (a 504 failed a whole job on 2026-11-13). Fetch it once, with retries, before the tests:
+      # they then start from the cache, and still fail if no server can be had.
+      - name: Download the Hardcharger server
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if .venv/bin/python -m hardcharger download; then exit 0; fi
+            echo "download failed (attempt $attempt of 5)"
+            sleep $((attempt * 15))
+          done
+          exit 1
       - name: Unit tests
         run: .venv/bin/python -m pytest tests/unit
       - name: Integration tests (a real Hardcharger server)
@@ -160,6 +171,17 @@ jobs:
                   wrong.append(name)
           sys.exit(f"not at their floors: {wrong}" if wrong else 0)
           PY
+      # The server binary comes from GitHub's release downloads, which answer 5xx now and then
+      # (a 504 failed a whole job on 2026-11-13). Fetch it once, with retries, before the tests:
+      # they then start from the cache, and still fail if no server can be had.
+      - name: Download the Hardcharger server
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if .venv/bin/python -m hardcharger download; then exit 0; fi
+            echo "download failed (attempt $attempt of 5)"
+            sleep $((attempt * 15))
+          done
+          exit 1
       - name: Unit tests
         run: .venv/bin/python -m pytest tests/unit
       - name: Integration tests (a real Hardcharger server)
