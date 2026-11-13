@@ -58,25 +58,63 @@ __all__ = [
 # ---------------------------------------------------------------------------------------------
 
 
-class TINYINT(sqltypes.Integer):
+def _to_int(value: Any) -> Any:
+    # sum() over an integer column is a HUGEINT, which the driver hands over as a Decimal.
+    return int(value) if type(value) is decimal.Decimal else value
+
+
+class _IntegerValues:
+    """Python integers in and out.
+
+    Sending: the driver binds every Python ``int`` as BIGINT, and DuckDB doesn't narrow a BIGINT
+    by itself (``round(x, ?)``, ``chr(?)``, ``date + ?`` all want an INTEGER), so INTEGER and
+    SMALLINT parameters are cast to their type. ``True``/``False`` go as 1/0, so a batch that
+    mixes them with integers has one Arrow type.
+
+    Receiving: integer aggregates wider than 64 bits (``sum()``) arrive as ``Decimal``.
+    """
+
+    def bind_processor(self, dialect: Any) -> Any:
+        def process(value: Any) -> Any:
+            return int(value) if isinstance(value, bool) else value
+
+        return process
+
+    def result_processor(self, dialect: Any, coltype: Any) -> Any:
+        return _to_int
+
+
+class _HardchargerInteger(_IntegerValues, sqltypes.Integer):
+    render_bind_cast = True
+
+
+class _HardchargerSmallInteger(_IntegerValues, sqltypes.SmallInteger):
+    render_bind_cast = True
+
+
+class _HardchargerBigInteger(_IntegerValues, sqltypes.BigInteger):
+    pass
+
+
+class TINYINT(_HardchargerInteger):
     """Signed 8-bit integer."""
 
     __visit_name__ = "TINYINT"
 
 
-class UTINYINT(sqltypes.Integer):
+class UTINYINT(_HardchargerInteger):
     """Unsigned 8-bit integer."""
 
     __visit_name__ = "UTINYINT"
 
 
-class USMALLINT(sqltypes.Integer):
+class USMALLINT(_HardchargerInteger):
     """Unsigned 16-bit integer."""
 
     __visit_name__ = "USMALLINT"
 
 
-class UINTEGER(sqltypes.Integer):
+class UINTEGER(_HardchargerInteger):
     """Unsigned 32-bit integer."""
 
     __visit_name__ = "UINTEGER"
@@ -84,13 +122,17 @@ class UINTEGER(sqltypes.Integer):
 
 class _WideInteger:
     """Integers past 64 bits: sent as text and cast (Arrow has no integer that wide), and
-    returned as a Python ``int`` (the driver hands 128-bit integers over as decimals)."""
+    returned as a Python ``int``."""
 
     render_bind_cast = True
 
     def bind_processor(self, dialect: Any) -> Any:
         def process(value: Any) -> Any:
-            return None if value is None else str(int(value))
+            if isinstance(value, bool):
+                return str(int(value))
+            # Anything else that isn't an integer goes as it is, for the server to refuse or
+            # convert by its own rules.
+            return str(value) if isinstance(value, int) else value
 
         return process
 
@@ -101,32 +143,35 @@ class _WideInteger:
         return process
 
 
-class UBIGINT(_WideInteger, sqltypes.BigInteger):
+class _ReadAsText(_WideInteger):
+    def column_expression(self, colexpr: Any) -> Any:
+        # The driver can't return every value of this type as a number (a HUGEINT of 39 digits
+        # doesn't fit Arrow's decimal, a BIGNUM comes in DuckDB's binary form): read its digits.
+        return type_coerce(sql_cast(colexpr, sqltypes.String()), self)  # type: ignore[arg-type]
+
+
+class UBIGINT(_WideInteger, _HardchargerBigInteger):
     """Unsigned 64-bit integer."""
 
     __visit_name__ = "UBIGINT"
 
 
-class HUGEINT(_WideInteger, sqltypes.BigInteger):
+class HUGEINT(_ReadAsText, _HardchargerBigInteger):
     """Signed 128-bit integer."""
 
     __visit_name__ = "HUGEINT"
 
 
-class UHUGEINT(_WideInteger, sqltypes.BigInteger):
+class UHUGEINT(_ReadAsText, _HardchargerBigInteger):
     """Unsigned 128-bit integer."""
 
     __visit_name__ = "UHUGEINT"
 
 
-class BIGNUM(_WideInteger, sqltypes.BigInteger):
+class BIGNUM(_ReadAsText, _HardchargerBigInteger):
     """Arbitrary-precision integer (DuckDB ``BIGNUM``), read as a Python ``int``."""
 
     __visit_name__ = "BIGNUM"
-
-    def column_expression(self, colexpr: Any) -> Any:
-        # The driver returns a BIGNUM in DuckDB's binary encoding: read its digits instead.
-        return type_coerce(sql_cast(colexpr, sqltypes.String()), self)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -269,6 +314,10 @@ class Struct(sqltypes.TypeEngine[Any]):
     def python_type(self) -> type:
         return dict
 
+    @property
+    def _static_cache_key(self) -> Any:  # a dict of fields isn't hashable as it is
+        return (self.__class__, tuple((n, t._static_cache_key) for n, t in self.fields.items()))
+
 
 class Map(sqltypes.TypeEngine[Any]):
     """``MAP(key type, value type)``: read as a list of ``(key, value)`` pairs, as the driver
@@ -296,6 +345,10 @@ class Union(sqltypes.TypeEngine[Any]):
         self.members: dict[str, TypeEngine[Any]] = {
             name: to_instance(type_) for name, type_ in members.items()
         }
+
+    @property
+    def _static_cache_key(self) -> Any:
+        return (self.__class__, tuple((n, t._static_cache_key) for n, t in self.members.items()))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -380,24 +433,33 @@ class _HardchargerLargeBinary(sqltypes.LargeBinary):
         return process
 
 
-class _HardchargerJSONPath(sqltypes.JSON.JSONPathType):
-    """A JSON path (``column[("a", 0, "b")]``) as the JSONPath text DuckDB's ``->`` and ``->>``
-    take: ``$."a"[0]."b"``."""
+def _json_key(key: Any) -> str:
+    """One step of a JSONPath: ``[3]`` for an array index, ``."name"`` for an object key."""
+    if isinstance(key, int) and not isinstance(key, bool):
+        return f"[{key}]"
+    return '."%s"' % str(key).replace("\\", "\\\\").replace('"', '\\"')
+
+
+class _JSONPathText:
+    """JSON keys and paths as the JSONPath text DuckDB's ``->`` and ``->>`` take.
+
+    A key is always sent as a path (``$."name"``), never bare: DuckDB reads a bare string that
+    starts with ``$`` as a JSONPath and one that starts with ``/`` as a JSON Pointer, so the keys
+    ``"$a"`` and ``"/p"`` would address something else.
+    """
+
+    string_bind_processor: Any
+    string_literal_processor: Any
 
     @staticmethod
-    def _path(value: Any) -> Any:
-        if value is None or isinstance(value, str):
-            return value  # already JSONPath text
-        return "$" + "".join(
-            f"[{part}]" if isinstance(part, int) else '."%s"' % str(part).replace('"', '\\"')
-            for part in value
-        )
+    def _format(value: Any) -> Any:
+        raise NotImplementedError
 
     def bind_processor(self, dialect: Any) -> Any:
         string_processor = self.string_bind_processor(dialect)
 
         def process(value: Any) -> Any:
-            value = self._path(value=value)
+            value = self._format(value)
             return string_processor(value) if string_processor else value
 
         return process
@@ -406,8 +468,113 @@ class _HardchargerJSONPath(sqltypes.JSON.JSONPathType):
         string_processor = self.string_literal_processor(dialect)
 
         def process(value: Any) -> Any:
-            value = self._path(value=value)
+            value = self._format(value)
             return string_processor(value) if string_processor else value
+
+        return process
+
+
+def _one_key(value: Any) -> Any:
+    return None if value is None else "$" + _json_key(key=value)
+
+
+class _HardchargerJSONIndex(_JSONPathText, sqltypes.JSON.JSONIndexType):
+    _format = staticmethod(_one_key)
+
+
+class _HardchargerJSONIntIndex(_JSONPathText, sqltypes.JSON.JSONIntIndexType):
+    _format = staticmethod(_one_key)
+
+
+class _HardchargerJSONStrIndex(_JSONPathText, sqltypes.JSON.JSONStrIndexType):
+    _format = staticmethod(_one_key)
+
+
+class _HardchargerJSONPath(_JSONPathText, sqltypes.JSON.JSONPathType):
+    """``column[("a", 0, "b")]`` -> ``$."a"[0]."b"``. A string is taken as JSONPath text."""
+
+    @staticmethod
+    def _format(value: Any) -> Any:
+        if value is None or isinstance(value, str):
+            return value
+        return "$" + "".join(_json_key(key=part) for part in value)
+
+
+class _HardchargerDateTime(sqltypes.DateTime):
+    """Datetimes whose stored value doesn't depend on what else is in the batch.
+
+    The driver builds one Arrow column per parameter, and Arrow gives a column one type: left
+    alone, a time-zone-aware value in a batch of naive ones is shifted to UTC, a naive one among
+    aware ones is taken as UTC, and a ``date`` first in a batch drops every later value's time.
+
+    ``DateTime()`` (TIMESTAMP): a value's wall-clock time is stored; an offset is dropped, as
+    PostgreSQL does. A ``date`` is midnight.
+
+    ``DateTime(timezone=True)`` (TIMESTAMP WITH TIME ZONE): values are sent as ISO text and cast.
+    An aware value is that instant; a naive one is read in the session's time zone.
+    """
+
+    @property
+    def render_bind_cast(self) -> bool:  # type: ignore[override]
+        return bool(self.timezone)
+
+    def bind_processor(self, dialect: Any) -> Any:
+        if self.timezone:
+
+            def with_zone(value: Any) -> Any:
+                if isinstance(value, datetime.datetime):
+                    return value.isoformat(sep=" ")
+                if isinstance(value, datetime.date):
+                    return value.isoformat()
+                return value
+
+            return with_zone
+
+        def without_zone(value: Any) -> Any:
+            if isinstance(value, datetime.datetime):
+                return value.replace(tzinfo=None) if value.tzinfo is not None else value
+            if isinstance(value, datetime.date):
+                return datetime.datetime(value.year, value.month, value.day)
+            return value
+
+        return without_zone
+
+
+def _parse_time_with_zone(text: str) -> datetime.time:
+    # DuckDB writes whole-hour offsets short ("12:00:00-05").
+    if len(text) > 3 and text[-3] in "+-" and text[-2:].isdigit():
+        text += ":00"
+    return datetime.time.fromisoformat(text)
+
+
+class _HardchargerTime(sqltypes.Time):
+    """``Time(timezone=True)`` (TIME WITH TIME ZONE) travels as text in both directions: as an
+    Arrow time the driver would drop the offset on the way in and on the way out."""
+
+    @property
+    def render_bind_cast(self) -> bool:  # type: ignore[override]
+        return bool(self.timezone)
+
+    def bind_processor(self, dialect: Any) -> Any:
+        if not self.timezone:
+            return None
+
+        def process(value: Any) -> Any:
+            return value.isoformat() if isinstance(value, datetime.time) else value
+
+        return process
+
+    def column_expression(self, colexpr: Any) -> Any:
+        if not self.timezone:
+            return colexpr
+        return type_coerce(sql_cast(colexpr, sqltypes.String()), self)
+
+    def result_processor(self, dialect: Any, coltype: Any) -> Any:
+        if not self.timezone:
+            return None
+
+        def process(value: Any) -> Any:
+            return _parse_time_with_zone(text=value) if isinstance(value, str) else value
 
         return process
 
@@ -441,7 +608,7 @@ class _HardchargerUuid(sqltypes.Uuid):
 
     def literal_processor(self, dialect: Any) -> Any:
         def process(value: Any) -> str:
-            return f"'{value}'"
+            return "'%s'" % str(value).replace("'", "''")
 
         return process
 
@@ -499,7 +666,7 @@ class _HardchargerInterval(postgresql.INTERVAL):
     def literal_processor(self, dialect: Any) -> Any:
         def process(value: Any) -> str:
             text = _interval_text(value=value) if isinstance(value, datetime.timedelta) else value
-            return f"INTERVAL '{text}'"
+            return "INTERVAL '%s'" % str(text).replace("'", "''")
 
         return process
 

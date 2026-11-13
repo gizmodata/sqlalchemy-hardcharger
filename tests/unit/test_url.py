@@ -48,8 +48,23 @@ def test_tls_false_spellings(value):
 
 
 def test_tls_must_be_a_boolean():
-    with pytest.raises(exc.ArgumentError, match="tls='maybe' is not a boolean"):
+    with pytest.raises(exc.ArgumentError, match="URL option 'tls' must be true or false"):
         connect_args("hardcharger://h?tls=maybe")
+
+
+def test_an_option_error_never_repeats_the_value():
+    """A secret pasted into the wrong option must not come back in the error."""
+    for url in (
+        "hardcharger://h?tls=tok_SECRET",
+        "hardcharger://h?tls_skip_verify=tok_SECRET",
+        "hardcharger://h?oauth_timeout=tok_SECRET",
+        "hardcharger://h?open_browser=tok_SECRET",
+        "hardcharger://h?adbc.chargewire.auth.access_token=tok_SECRET",
+        "hardcharger://h?bogus=tok_SECRET",
+    ):
+        with pytest.raises(exc.ArgumentError) as caught:
+            connect_args(url)
+        assert "tok_SECRET" not in str(caught.value)
 
 
 def test_ipv6_host_keeps_its_brackets():
@@ -106,12 +121,41 @@ def test_token_sign_in_options():
     assert connect_args("hardcharger://h?subject_token=xyz")["subject_token"] == "xyz"
 
 
-def test_open_browser_may_name_a_command():
-    assert connect_args("hardcharger://h?open_browser=firefox")["open_browser"] == "firefox"
+def test_a_url_cannot_name_a_program_to_run():
+    """The driver runs open_browser's text as a command during browser sign-in, and URLs are
+    often configuration someone else supplies: only true/false is accepted in a URL."""
+    assert connect_args("hardcharger://h?open_browser=false")["open_browser"] is False
+    assert connect_args("hardcharger://h?open_browser=true")["open_browser"] is True
+    with pytest.raises(exc.ArgumentError, match="'open_browser' must be true or false"):
+        connect_args("hardcharger://h?auth_type=external&open_browser=touch+/tmp/marker")
+    for option in (
+        "adbc.hardcharger.oauth.browser",
+        "adbc.hardcharger.oauth.sign_in_key",
+        "adbc.chargewire.session.id",
+        "adbc.chargewire.auth.access_token",
+        "adbc.chargewire.tls.skip_verify",
+        "adbc.something.new",
+    ):
+        with pytest.raises(exc.ArgumentError, match="can't be set in a URL"):
+            connect_args(f"hardcharger://h?{option}=x")
+
+
+def test_connect_args_still_take_everything_the_driver_does():
+    dialect = HardchargerDialect()
+    dialect.dbapi = _FakeDbapi()
+    dialect.connect(
+        uri="hardcharger://h",
+        auth_type="external",
+        open_browser="my-browser --new-window",
+        db_kwargs={"adbc.chargewire.session.id": "s_1"},
+    )
+    (call,) = dialect.dbapi.calls
+    assert call["open_browser"] == "my-browser --new-window"
+    assert call["db_kwargs"] == {"adbc.chargewire.session.id": "s_1"}
 
 
 def test_number_options_must_be_numbers():
-    with pytest.raises(exc.ArgumentError, match="oauth_timeout='soon' is not a number"):
+    with pytest.raises(exc.ArgumentError, match="URL option 'oauth_timeout' must be a number"):
         connect_args("hardcharger://h?oauth_timeout=soon")
 
 
@@ -150,18 +194,35 @@ class _FakeDbapi:
         return object()
 
 
+def test_browser_sign_in_is_shared_within_one_engine_only():
+    first, second = HardchargerDialect(), HardchargerDialect()
+    first.dbapi, second.dbapi = _FakeDbapi(), _FakeDbapi()
+    for _ in range(2):
+        first.connect(uri="hardcharger://h", auth_type="external")
+    second.connect(uri="hardcharger://h", auth_type="external")
+    scopes = [call["share_sign_in"] for call in first.dbapi.calls]
+    other = second.dbapi.calls[0]["share_sign_in"]
+    # one engine's connections share a sign-in ...
+    assert scopes[0] == scopes[1] and isinstance(scopes[0], str) and len(scopes[0]) > 30
+    # ... and another engine (another user of the same process) never does
+    assert other != scopes[0]
+
+
 @pytest.mark.parametrize(
     ("given", "expected"),
     [
-        ({"auth_type": "external"}, {"auth_type": "external", "share_sign_in": True}),
         (
             {"auth_type": "external", "share_sign_in": False},
             {"auth_type": "external", "share_sign_in": False},
         ),
+        (
+            {"auth_type": "external", "share_sign_in": "team"},
+            {"auth_type": "external", "share_sign_in": "team"},
+        ),
         ({"username": "u", "password": "p"}, {"username": "u", "password": "p"}),
     ],
 )
-def test_browser_sign_in_is_shared_across_the_pool_unless_told_otherwise(given, expected):
+def test_an_explicit_sign_in_choice_is_kept(given, expected):
     dialect = HardchargerDialect()
     dialect.dbapi = _FakeDbapi()
     connection = dialect.connect(uri="hardcharger://h", **given)
@@ -169,36 +230,38 @@ def test_browser_sign_in_is_shared_across_the_pool_unless_told_otherwise(given, 
     assert dialect.dbapi.calls == [{"uri": "hardcharger://h", **expected}]
 
 
-class _RecordingCursor:
-    def __init__(self, owner):
-        self.owner = owner
+class _RecordingAdbcConnection:
+    def __init__(self):
+        self.options = []
 
-    def execute(self, statement):
-        self.owner.statements.append(statement)
-
-    def close(self):
-        pass
+    def set_options(self, **options):
+        self.options.append(options)
 
 
 class _RecordingConnection:
     def __init__(self):
+        self.adbc_connection = _RecordingAdbcConnection()
         self.statements = []
 
     def cursor(self):
-        return _RecordingCursor(owner=self)
+        raise AssertionError("no SQL is to be sent at connect")
 
 
-def test_a_schema_of_a_named_catalog_is_chosen_after_connecting():
+def test_a_schema_of_a_named_catalog_is_set_as_a_driver_option_after_connecting():
+    """Not with USE in SQL: the driver re-applies options when the server replaces an idle
+    session, and refuses to replace one whose state was set in SQL."""
     dialect = HardchargerDialect()
     dialect.dbapi = _FakeDbapi()
     driver_connection = _RecordingConnection()
-    dialect.dbapi.connect = lambda **kwargs: (
-        dialect.dbapi.calls.append(kwargs),
-        driver_connection,
-    )[1]
+
+    def connect(**kwargs):
+        dialect.dbapi.calls.append(kwargs)
+        return driver_connection
+
+    dialect.dbapi.connect = connect
     dialect.connect(uri="hardcharger://h", catalog="Lake", db_schema="my sales")
     assert dialect.dbapi.calls == [{"uri": "hardcharger://h", "catalog": "Lake"}]
-    assert driver_connection.statements == ['USE "Lake"."my sales"']
+    assert driver_connection.adbc_connection.options == [{"adbc.connection.db_schema": "my sales"}]
 
 
 def test_a_schema_alone_is_left_to_the_driver():

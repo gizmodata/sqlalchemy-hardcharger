@@ -9,6 +9,7 @@ driver over Chargewire HTTP(S), and reflection reads DuckDB's own catalog functi
 from __future__ import annotations
 
 import re
+import uuid
 from typing import Any
 
 from sqlalchemy import exc, pool, schema, text, util
@@ -61,19 +62,54 @@ RESERVED_WORDS = frozenset(
 _TRUE = frozenset({"true", "1", "yes", "on"})
 _FALSE = frozenset({"false", "0", "no", "off"})
 
-# Error codes after which the connection's session is gone for good: the pool then discards the
-# connection and opens another instead of handing the dead one out again.
-_DISCONNECT_MARKERS = (
-    "(session_ended",
-    "(session_not_found",
-    "(invalid_token",
-    "(server_draining",
-    "connection refused",
-    "connection reset by peer",
-    "broken pipe",
-    "no such host",
-    "unexpected EOF",
+# A connection is dead, and the pool should replace it, when the driver reports a transport
+# failure or a session or token the server no longer accepts. The driver's ADBC status code says
+# so; the message text alone never does, because an error message can quote the application's own
+# data ("Could not convert string 'connection refused' to INT32").
+_STATUS_IO = 10
+_STATUS_UNAUTHENTICATED = 13
+# Statuses of errors about the statement or its data: never a lost connection.
+_STATEMENT_STATUSES = frozenset({2, 4, 5, 7, 8, 11, 14})
+_SESSION_GONE = re.compile(
+    r"\((?:session_ended|session_not_found|invalid_token|server_draining)[,)]"
 )
+
+# A statement that is nothing but transaction control, sent as SQL text (text("COMMIT")).
+_TRANSACTION_CONTROL = re.compile(
+    r"\s*(?:(?:--[^\n]*\n|/\*.*?\*/)\s*)*(BEGIN|START|COMMIT|ROLLBACK|END|ABORT)\b",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+# Driver options a URL may set. Everything else under adbc.* is refused in a URL, because a URL
+# is often configuration that someone else supplies, and other driver options name programs to
+# run (the browser command) or sessions and tokens to adopt. They remain available to the
+# application's own code through create_engine(connect_args={"db_kwargs": {...}}).
+_ADBC_URL_OPTIONS = (
+    "adbc.chargewire.statement.async",
+    "adbc.chargewire.statement.retain_result",
+    "adbc.chargewire.statement.timeout_seconds",
+    "adbc.chargewire.statement.result_partitions",
+    "adbc.chargewire.statement.result_order",
+    "adbc.chargewire.ipc_compression",
+    "adbc.chargewire.ingest.parts",
+    "adbc.hardcharger.ingest.parts",
+    "adbc.chargewire.retry.max_attempts",
+    "adbc.chargewire.session.reconnect",
+)
+
+# A temporary table or view hides a permanent one of the same name, in reflection as in a query:
+# when the session has a temporary object called :hc_table, only its rows are the answer.
+_TEMPORARY_SHADOWS = (
+    " AND (database_name = 'temp' OR NOT EXISTS ("
+    "SELECT 1 FROM duckdb_tables() "
+    "WHERE database_name = 'temp' AND lower(table_name) = lower(:hc_table)"
+    " UNION ALL "
+    "SELECT 1 FROM duckdb_views() "
+    "WHERE database_name = 'temp' AND NOT internal AND lower(view_name) = lower(:hc_table)))"
+)
+
+#: The comment the dialect puts on a sequence it creates to number a table's key.
+SEQUENCE_COMMENT_PREFIX = "sqlalchemy-hardcharger:"
 
 
 def _as_bool(name: str, value: str) -> bool:
@@ -82,7 +118,7 @@ def _as_bool(name: str, value: str) -> bool:
         return True
     if lowered in _FALSE:
         return False
-    raise exc.ArgumentError(f"URL option {name}={value!r} is not a boolean: use true or false")
+    raise exc.ArgumentError(f"URL option {name!r} must be true or false")
 
 
 def _as_bool_or_text(name: str, value: str) -> Any:
@@ -98,7 +134,7 @@ def _as_float(name: str, value: str) -> float:
     try:
         return float(value)
     except ValueError:
-        raise exc.ArgumentError(f"URL option {name}={value!r} is not a number") from None
+        raise exc.ArgumentError(f"URL option {name!r} must be a number") from None
 
 
 def _as_text(name: str, value: str) -> str:
@@ -112,7 +148,7 @@ _URL_OPTIONS: dict[str, tuple[str, Any]] = {
     "access_token": ("access_token", _as_text),
     "subject_token": ("subject_token", _as_text),
     "oauth_timeout": ("oauth_timeout", _as_float),
-    "open_browser": ("open_browser", _as_bool_or_text),
+    "open_browser": ("open_browser", _as_bool),
     "share_sign_in": ("share_sign_in", _as_bool_or_text),
     "resume_timeout": ("resume_timeout", _as_float),
     "session_tag": ("session_tag", _as_text),
@@ -188,6 +224,23 @@ class HardchargerConnection:
         finally:
             self.in_transaction = False
 
+    def after_transaction_control(self, keyword: str) -> None:
+        """Keep track when the application sends BEGIN, COMMIT or ROLLBACK as SQL text.
+
+        A raw BEGIN on an AUTOCOMMIT connection opens a transaction SQLAlchemy doesn't know
+        about: remember it, so returning the connection to the pool rolls it back instead of
+        leaving it open for the next user's work to vanish into. A raw COMMIT or ROLLBACK inside
+        a transaction SQLAlchemy is running ends it on the server while SQLAlchemy still counts
+        on one: begin the next, so later work is still covered by commit() and rollback().
+        """
+        if keyword in ("BEGIN", "START"):
+            self.in_transaction = True
+        elif self.autocommit:
+            self.in_transaction = False
+        elif self.in_transaction:
+            self.in_transaction = False
+            self.begin()
+
     def close(self) -> None:
         self.in_transaction = False
         self.driver_connection.close()
@@ -199,30 +252,31 @@ class HardchargerConnection:
 
 
 def _serial_sequence(column: Any, schema_name: str | None) -> schema.Sequence | None:
-    """The sequence that numbers an auto-incrementing integer primary key.
+    """The sequence that numbers an auto-incrementing integer column.
 
     DuckDB has neither ``SERIAL`` nor identity columns, so a column SQLAlchemy treats as
-    auto-incrementing (an integer primary key with no default of its own, or one declared with
-    ``Identity()``) gets ``DEFAULT nextval('<table>_<column>_seq')``, and CREATE TABLE creates
-    that sequence first. Returns ``None`` for every other column.
+    auto-incrementing (an integer primary key with no default of its own) and any integer column
+    declared with ``Identity()`` gets ``DEFAULT nextval('<table>_<column>_seq')``, and CREATE
+    TABLE creates that sequence first. Returns ``None`` for every other column.
     """
     table = column.table
-    if table is None or not column.primary_key or column is not table._autoincrement_column:
-        return None
-    if column.type._type_affinity is not sqltypes.Integer:
+    if table is None or column.type._type_affinity is not sqltypes.Integer:
         return None
     identity = column.identity
-    if column.default is not None:
-        if not (isinstance(column.default, schema.Sequence) and column.default.optional):
-            return None
-    if column.server_default is not None and identity is None:
-        return None
     options: dict[str, Any] = {}
     if identity is not None:
         for name in ("start", "increment", "minvalue", "maxvalue", "cycle"):
             value = getattr(identity, name, None)
             if value is not None:
                 options[name] = value
+    else:
+        if not column.primary_key or column is not table._autoincrement_column:
+            return None
+        if column.default is not None:
+            if not (isinstance(column.default, schema.Sequence) and column.default.optional):
+                return None
+        if column.server_default is not None:
+            return None
     return schema.Sequence(f"{table.name}_{column.name}_seq", schema=schema_name, **options)
 
 
@@ -236,6 +290,9 @@ class HardchargerIdentifierPreparer(PGIdentifierPreparer):
         names being ``catalog.schema.table``. A name that itself contains a dot is written
         quoted: ``'"my.catalog".main'``.
         """
+        if getattr(name, "quote", None) is not None:
+            # A quoted_name with quote=True or False is one schema name, taken whole.
+            return None, str(name)
         parts = [
             quoted.replace('""', '"') if quoted or not plain else plain
             for quoted, plain in re.findall(r'"((?:[^"]|"")*)"|([^."]+)', name)
@@ -250,6 +307,13 @@ class HardchargerIdentifierPreparer(PGIdentifierPreparer):
         )
 
     def format_schema(self, name: str) -> str:
+        force = getattr(name, "quote", None)
+        if force is False:
+            # Written as it is: this is how SQLAlchemy passes its schema_translate_map
+            # placeholder through, to replace it with the (then quoted) real name later.
+            return str(name)
+        if force:
+            return self.quote_identifier(str(name))
         catalog, schema_name = self._separate(name=name)
         if catalog is None:
             return self.quote(schema_name)
@@ -365,12 +429,13 @@ class HardchargerDDLCompiler(PGDDLCompiler):
             colspec += " NOT NULL"
         return colspec
 
-    def _serial_sequences(self, table: Any) -> list[schema.Sequence]:
-        column = table._autoincrement_column
-        if column is None:
-            return []
-        sequence = self._serial_sequence(column=column)
-        return [] if sequence is None else [sequence]
+    def _serial_sequences(self, table: Any) -> list[tuple[Any, schema.Sequence]]:
+        found = []
+        for column in table.columns:
+            sequence = self._serial_sequence(column=column)
+            if sequence is not None:
+                found.append((column, sequence))
+        return found
 
     def visit_create_table(self, create: Any, **kw: Any) -> str:
         statement = super().visit_create_table(create, **kw)
@@ -378,18 +443,26 @@ class HardchargerDDLCompiler(PGDDLCompiler):
         table = create.element
         # A temporary table's sequence is temporary too, so it goes when the session does.
         temporary = any(p.upper() in ("TEMPORARY", "TEMP") for p in table._prefixes)
-        for sequence in self._serial_sequences(table=table):
+        for column, sequence in self._serial_sequences(table=table):
             options = self.get_identity_options(sequence)
+            name = self.preparer.format_sequence(sequence)
             prefix += "CREATE %sSEQUENCE IF NOT EXISTS %s%s;\n" % (
                 "TEMPORARY " if temporary else "",
-                self.preparer.format_sequence(sequence),
+                name,
                 f" {options}" if options else "",
+            )
+            # Marks the sequence as this table's own, so tools that drop the table by name
+            # alone (Alembic's op.drop_table) can find and drop it too.
+            comment = f"{SEQUENCE_COMMENT_PREFIX} numbers {table.name}.{column.name}"
+            prefix += "COMMENT ON SEQUENCE %s IS %s;\n" % (
+                name,
+                self.sql_compiler.render_literal_value(comment, sqltypes.STRINGTYPE),
             )
         return prefix + statement
 
     def visit_drop_table(self, drop: Any, **kw: Any) -> str:
         statement = super().visit_drop_table(drop, **kw)
-        for sequence in self._serial_sequences(table=drop.element):
+        for _, sequence in self._serial_sequences(table=drop.element):
             statement += ";\nDROP SEQUENCE IF EXISTS %s" % self.preparer.format_sequence(sequence)
         return statement
 
@@ -618,6 +691,14 @@ class HardchargerDialect(PGDialect):
     colspecs = util.update_copy(
         PGDialect.colspecs,
         {
+            sqltypes.Integer: hctypes._HardchargerInteger,
+            sqltypes.SmallInteger: hctypes._HardchargerSmallInteger,
+            sqltypes.BigInteger: hctypes._HardchargerBigInteger,
+            sqltypes.DateTime: hctypes._HardchargerDateTime,
+            sqltypes.Time: hctypes._HardchargerTime,
+            sqltypes.JSON.JSONIndexType: hctypes._HardchargerJSONIndex,
+            sqltypes.JSON.JSONIntIndexType: hctypes._HardchargerJSONIntIndex,
+            sqltypes.JSON.JSONStrIndexType: hctypes._HardchargerJSONStrIndex,
             sqltypes.Numeric: hctypes._HardchargerNumeric,
             sqltypes.Float: hctypes._HardchargerFloat,
             sqltypes.LargeBinary: hctypes._HardchargerLargeBinary,
@@ -633,6 +714,9 @@ class HardchargerDialect(PGDialect):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        # Browser sign-ins are shared among this engine's pooled connections only: two engines
+        # in one process (two users of one application) never share a signed-in identity.
+        self._sign_in_scope = f"sqlalchemy-hardcharger-{uuid.uuid4().hex}"
 
     # -- connecting ---------------------------------------------------------------------------
 
@@ -652,8 +736,10 @@ class HardchargerDialect(PGDialect):
         TLS is on unless ``?tls=false``. The path names the catalog to make current, and
         ``?schema=`` the schema. The other options are ``connect()`` keywords of the Hardcharger
         ADBC driver (``auth_type``, ``access_token``, ``tls_skip_verify``, ``tls_root_certs``,
-        ...); ``hardcharger.<name>`` is a session setting and ``adbc.<...>`` a driver option.
-        Anything else is refused, never dropped.
+        ...); ``hardcharger.<name>`` is a session setting, and a few ``adbc.<...>`` driver
+        options that tune statements are accepted. Anything else is refused, never dropped: in
+        particular nothing in a URL can name a program to run. ``connect_args`` takes everything
+        the driver's ``connect()`` does.
         """
         kwargs: dict[str, Any] = {}
         query: dict[str, str] = {}
@@ -698,12 +784,19 @@ class HardchargerDialect(PGDialect):
                 kwargs[keyword] = convert(name, value)
             elif name.startswith("hardcharger."):
                 settings[name[len("hardcharger.") :]] = value
-            elif name.startswith("adbc."):
+            elif name in _ADBC_URL_OPTIONS:
                 db_kwargs[name] = value
+            elif name.startswith("adbc."):
+                raise exc.ArgumentError(
+                    f"the driver option {name!r} can't be set in a URL: pass it in "
+                    'create_engine(url, connect_args={"db_kwargs": {...}}). In a URL: '
+                    f"{', '.join(_ADBC_URL_OPTIONS)}"
+                )
             else:
                 raise exc.ArgumentError(
                     f"unknown hardcharger:// URL option {name!r}. Options: tls, catalog, "
-                    f"{', '.join(sorted(_URL_OPTIONS))}, hardcharger.<setting> and adbc.<option>"
+                    f"{', '.join(sorted(_URL_OPTIONS))}, hardcharger.<setting> and the driver "
+                    f"options {', '.join(_ADBC_URL_OPTIONS)}"
                 )
         if settings:
             kwargs["settings"] = settings
@@ -713,21 +806,20 @@ class HardchargerDialect(PGDialect):
 
     def connect(self, *cargs: Any, **cparams: Any) -> Any:
         if cparams.get("auth_type") == "external":
-            # One browser sign-in for the whole pool, not one window per pooled connection.
-            cparams.setdefault("share_sign_in", True)
+            # One browser sign-in for this engine's pool, not one window per pooled connection.
+            cparams.setdefault("share_sign_in", self._sign_in_scope)
         # The driver applies a schema before the catalog (adbc-driver-hardcharger 2.4.9), so a
         # schema of a catalog that isn't the server's default is "not found". When both are
-        # given, the driver sets the catalog and the schema is chosen here, once connected.
+        # given, connect with the catalog and then set the schema, as a connection option (not
+        # with USE in SQL): the driver keeps options and re-applies them when the server replaces
+        # an idle session, which it refuses to do after session state was set in SQL.
         schema_name = cparams.pop("db_schema", None) if cparams.get("catalog") else None
         driver_connection = self.loaded_dbapi.connect(*cargs, **cparams)
         if schema_name is not None:
-            quote = self.identifier_preparer.quote_identifier
             try:
-                cursor = driver_connection.cursor()
-                try:
-                    cursor.execute(f"USE {quote(cparams['catalog'])}.{quote(schema_name)}")
-                finally:
-                    cursor.close()
+                driver_connection.adbc_connection.set_options(
+                    **{"adbc.connection.db_schema": schema_name}
+                )
             except Exception:
                 driver_connection.close()
                 raise
@@ -747,8 +839,31 @@ class HardchargerDialect(PGDialect):
         return connection.exec_driver_sql("SELECT current_schema()").scalar()
 
     def is_disconnect(self, e: Any, connection: Any, cursor: Any) -> bool:
-        message = str(e)
-        return any(marker in message for marker in _DISCONNECT_MARKERS)
+        status = getattr(e, "status_code", None)
+        status = getattr(status, "value", status)
+        if status in (_STATUS_IO, _STATUS_UNAUTHENTICATED):
+            return True
+        if status in _STATEMENT_STATUSES:
+            return False
+        return _SESSION_GONE.search(str(e)) is not None
+
+    def _note_transaction_control(self, statement: Any, context: Any) -> None:
+        match = _TRANSACTION_CONTROL.match(statement) if isinstance(statement, str) else None
+        if match is None or context is None:
+            return
+        connection = getattr(context, "root_connection", None)
+        if connection is not None:
+            wrapped = getattr(connection.connection, "dbapi_connection", None)
+            if isinstance(wrapped, HardchargerConnection):
+                wrapped.after_transaction_control(keyword=match.group(1).upper())
+
+    def do_execute(self, cursor: Any, statement: Any, parameters: Any, context: Any = None) -> None:
+        cursor.execute(statement, parameters)
+        self._note_transaction_control(statement=statement, context=context)
+
+    def do_execute_no_params(self, cursor: Any, statement: Any, context: Any = None) -> None:
+        cursor.execute(statement)
+        self._note_transaction_control(statement=statement, context=context)
 
     def do_executemany(
         self, cursor: Any, statement: Any, parameters: Any, context: Any = None
@@ -826,14 +941,18 @@ class HardchargerDialect(PGDialect):
         if temporary == "only":
             return "database_name = 'temp'", {}
         if schema is None:
-            where = "(database_name = current_catalog() AND schema_name = current_schema())"
+            where = (
+                "(lower(database_name) = lower(current_catalog())"
+                " AND lower(schema_name) = lower(current_schema()))"
+            )
             if temporary == "include":
                 where = f"({where} OR database_name = 'temp')"
             return where, {}
         catalog, schema_name = self.identifier_preparer._separate(name=schema)
         if catalog is None:
             return (
-                "(database_name = current_catalog() AND lower(schema_name) = lower(:hc_schema))",
+                "(lower(database_name) = lower(current_catalog())"
+                " AND lower(schema_name) = lower(:hc_schema))",
                 {"hc_schema": schema_name},
             )
         return (
@@ -1037,11 +1156,12 @@ class HardchargerDialect(PGDialect):
     ) -> list[Any]:
         where, params = self._scope(schema=schema, temporary="include")
         params["hc_table"] = table_name
+        shadow = _TEMPORARY_SHADOWS if schema is None else ""
         return list(
             connection.execute(
                 text(
                     f"SELECT {columns} FROM {function}() "
-                    f"WHERE {where} AND lower({name_column}) = lower(:hc_table){extra}"
+                    f"WHERE {where} AND lower({name_column}) = lower(:hc_table){shadow}{extra}"
                 ),
                 params,
             )
@@ -1079,7 +1199,12 @@ class HardchargerDialect(PGDialect):
                 "type": type_,
                 "nullable": bool(nullable),
                 "default": None if generated else default,
-                "autoincrement": bool(default) and not generated and "nextval(" in default,
+                "autoincrement": (
+                    bool(default)
+                    and not generated
+                    and "nextval(" in default
+                    and type_._type_affinity is sqltypes.Integer
+                ),
                 "comment": comment,
             }
             if generated:
@@ -1096,13 +1221,15 @@ class HardchargerDialect(PGDialect):
         self._require_table(connection=connection, table_name=table_name, schema=schema)
         where, params = self._scope(schema=schema, temporary="include")
         params.update({"hc_table": table_name, "hc_kind": kind})
+        shadow = _TEMPORARY_SHADOWS if schema is None else ""
         return list(
             connection.execute(
                 text(
                     "SELECT constraint_name, constraint_column_names, expression, "
                     "referenced_table, referenced_column_names "
                     f"FROM duckdb_constraints() WHERE {where} "
-                    "AND lower(table_name) = lower(:hc_table) AND constraint_type = :hc_kind "
+                    "AND lower(table_name) = lower(:hc_table) "
+                    f"AND constraint_type = :hc_kind{shadow} "
                     "ORDER BY constraint_index"
                 ),
                 params,
@@ -1319,8 +1446,8 @@ def _index_expressions(text: str) -> list[tuple[str, bool]]:  # noqa: A002
                 continue
             if len(item) >= 2 and item[0] == "'" and item[-1] == "'":
                 item = item[1:-1].replace("\\'", "'")
-            if len(item) >= 2 and item[0] == '"' and item[-1] == '"' and '"' not in item[1:-1]:
-                parts.append((item[1:-1], True))
+            if re.fullmatch(r'"(?:[^"]|"")*"', item):
+                parts.append((item[1:-1].replace('""', '"'), True))
             elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", item):
                 parts.append((item, True))
             else:

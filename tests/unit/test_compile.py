@@ -47,12 +47,31 @@ def test_integer_primary_key_gets_a_sequence(metadata):
     )
     assert sql(CreateTable(table)) == (
         "CREATE SEQUENCE IF NOT EXISTS users_id_seq;\n"
+        "COMMENT ON SEQUENCE users_id_seq IS 'sqlalchemy-hardcharger: numbers users.id';\n"
         "\nCREATE TABLE users (\n"
         "\tid INTEGER DEFAULT nextval('users_id_seq') NOT NULL, \n"
         "\tname VARCHAR, \n"
         "\tPRIMARY KEY (id)\n)\n\n"
     )
     assert sql(DropTable(table)) == "\nDROP TABLE users;\nDROP SEQUENCE IF EXISTS users_id_seq"
+
+
+def test_an_identity_column_that_is_not_the_key_gets_a_sequence_too(metadata):
+    table = Table(
+        "orders",
+        metadata,
+        Column("code", String, primary_key=True),
+        Column("number", Integer, Identity(start=500)),
+    )
+    ddl = sql(CreateTable(table))
+    assert "CREATE SEQUENCE IF NOT EXISTS orders_number_seq START WITH 500;\n" in ddl
+    assert "number INTEGER DEFAULT nextval('orders_number_seq')" in ddl
+    assert sql(DropTable(table)).endswith("DROP SEQUENCE IF EXISTS orders_number_seq")
+
+
+def test_a_quote_in_a_table_name_is_escaped_in_the_sequence_comment(metadata):
+    table = Table("it's", metadata, Column("id", Integer, primary_key=True))
+    assert """IS 'sqlalchemy-hardcharger: numbers it''s.id';""" in sql(CreateTable(table))
 
 
 def test_the_sequence_lives_in_the_tables_schema_and_is_quoted_like_it(metadata):
@@ -190,7 +209,21 @@ def t(metadata):
 
 
 def test_parameters_are_question_marks(t):
-    assert sql(select(t.c.id).where(t.c.n == 5)) == "SELECT t.id \nFROM t \nWHERE t.n = ?"
+    assert sql(select(t.c.id).where(t.c.s == "x")) == "SELECT t.id \nFROM t \nWHERE t.s = ?"
+
+
+def test_integer_parameters_are_cast_so_functions_accept_them(t):
+    # The driver binds a Python int as BIGINT, which DuckDB won't narrow for round(x, ?).
+    assert sql(select(t.c.id).where(t.c.n == 5)) == (
+        "SELECT t.id \nFROM t \nWHERE t.n = ?::INTEGER"
+    )
+    assert sql(select(func.round(t.c.n, 2))) == "SELECT round(t.n, ?::INTEGER) AS round_1 \nFROM t"
+    big = select(t.c.id).where(t.c.n == 2**40)  # past 32 bits: SQLAlchemy types it BIGINT
+    assert sql(big) == "SELECT t.id \nFROM t \nWHERE t.n = ?::INTEGER"
+    from sqlalchemy import literal
+
+    assert sql(select(literal(2**40))) == "SELECT ? AS anon_1"
+    assert sql(select(literal(7))) == "SELECT ?::INTEGER AS anon_1"
 
 
 def test_for_update_is_dropped(t):
@@ -229,12 +262,20 @@ def test_ilike_and_limit_offset(t):
 
 
 def test_json_access_uses_arrows_and_jsonpath(t):
-    assert literal(select(t.c.doc["a"])) == "SELECT t.doc -> 'a' AS anon_1 \nFROM t"
+    # A key is always a JSONPath: sent bare, DuckDB would read "$a" as a path and "/p" as a
+    # JSON Pointer and address something else.
+    assert literal(select(t.c.doc["a"])) == """SELECT t.doc -> '$."a"' AS anon_1 \nFROM t"""
+    assert literal(select(t.c.doc["$a"])) == """SELECT t.doc -> '$."$a"' AS anon_1 \nFROM t"""
+    assert literal(select(t.c.doc["/p"])) == """SELECT t.doc -> '$."/p"' AS anon_1 \nFROM t"""
+    assert literal(select(t.c.doc[3])) == "SELECT t.doc -> '$[3]' AS anon_1 \nFROM t"
     assert literal(select(t.c.doc[("a", 0, "b")])) == (
         """SELECT t.doc -> '$."a"[0]."b"' AS anon_1 \nFROM t"""
     )
     assert literal(select(t.c.doc[("a", "b")].as_integer())) == (
         """SELECT CAST(t.doc ->> '$."a"."b"' AS INTEGER) AS anon_1 \nFROM t"""
+    )
+    assert literal(select(t.c.doc['q"\\'])) == (
+        """SELECT t.doc -> '$."q\\"\\\\"' AS anon_1 \nFROM t"""
     )
 
 
@@ -245,14 +286,17 @@ def test_match_is_refused_with_a_pointer_to_full_text_search(t):
 
 def test_returning_and_upsert(t):
     assert sql(t.insert().values(n=1).returning(t.c.id)) == (
-        "INSERT INTO t (n) VALUES (?) RETURNING t.id"
+        "INSERT INTO t (n) VALUES (?::INTEGER) RETURNING t.id"
     )
     upsert = insert(t).values(id=1, n=2)
     assert sql(
         upsert.on_conflict_do_update(index_elements=[t.c.id], set_={"n": upsert.excluded.n})
-    ) == ("INSERT INTO t (id, n) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET n = excluded.n")
+    ) == (
+        "INSERT INTO t (id, n) VALUES (?::INTEGER, ?::INTEGER) "
+        "ON CONFLICT (id) DO UPDATE SET n = excluded.n"
+    )
     assert sql(upsert.on_conflict_do_nothing()) == (
-        "INSERT INTO t (id, n) VALUES (?, ?) ON CONFLICT DO NOTHING"
+        "INSERT INTO t (id, n) VALUES (?::INTEGER, ?::INTEGER) ON CONFLICT DO NOTHING"
     )
 
 
@@ -276,9 +320,70 @@ def test_variant_is_written_and_read_through_json(metadata):
 
     table = Table("v", metadata, Column("id", Integer), Column("value", VARIANT))
     assert sql(table.insert().values(id=1, value={"a": 1})) == (
-        "INSERT INTO v (id, value) VALUES (?, CAST(CAST(? AS JSON) AS VARIANT))"
+        "INSERT INTO v (id, value) VALUES (?::INTEGER, CAST(CAST(? AS JSON) AS VARIANT))"
     )
     assert sql(select(table)) == "SELECT v.id, CAST(v.value AS JSON) AS value \nFROM v"
+
+
+def test_values_written_as_literals_are_quoted(metadata):
+    """literal_binds / literal_execute / Alembic's offline SQL write values into the statement."""
+    import datetime
+
+    hostile = "00000000-0000-0000-0000-000000000000' OR 1=1 --"
+    table = Table(
+        "lit",
+        metadata,
+        Column("u", sqltypes.Uuid(as_uuid=False)),
+        Column("i", sqltypes.Interval),
+    )
+    assert literal(select(table.c.u).where(table.c.u == hostile)) == (
+        "SELECT lit.u \nFROM lit \nWHERE lit.u = '00000000-0000-0000-0000-000000000000'' OR 1=1 --'"
+    )
+    assert literal(select(table.c.i).where(table.c.i == "1 day' + INTERVAL '100 years")) == (
+        "SELECT lit.i \nFROM lit \nWHERE lit.i = '1 day'' + INTERVAL ''100 years'"
+    )
+    assert literal(select(table.c.i).where(table.c.i == datetime.timedelta(days=2))) == (
+        "SELECT lit.i \nFROM lit \nWHERE lit.i = INTERVAL '2 days 0 seconds 0 microseconds'"
+    )
+
+
+def test_datetime_and_time_with_time_zone_are_sent_as_text_and_cast(metadata):
+    table = Table(
+        "zoned",
+        metadata,
+        Column("naive", sqltypes.DateTime),
+        Column("aware", sqltypes.DateTime(timezone=True)),
+        Column("t", sqltypes.Time),
+        Column("tz", sqltypes.Time(timezone=True)),
+    )
+    assert sql(table.insert()) == (
+        "INSERT INTO zoned (naive, aware, t, tz) "
+        "VALUES (?, ?::TIMESTAMP WITH TIME ZONE, ?, ?::TIME WITH TIME ZONE)"
+    )
+    assert sql(select(table)) == (
+        "SELECT zoned.naive, zoned.aware, zoned.t, CAST(zoned.tz AS VARCHAR) AS tz \nFROM zoned"
+    )
+
+
+def test_schema_translate_map_and_quoted_names(metadata):
+    from sqlalchemy.sql.elements import quoted_name
+
+    table = Table("t", metadata, Column("a", Integer), schema="per_tenant")
+    for target, expected in [
+        ("plain", "plain.t"),
+        ("Tenant_A", '"Tenant_A".t'),
+        ("tenant-1", '"tenant-1".t'),
+        ("lake.sales", "lake.sales.t"),
+    ]:
+        compiled = select(table.c.a).compile(
+            dialect=DIALECT,
+            schema_translate_map={"per_tenant": target},
+            render_schema_translate=True,
+        )
+        assert str(compiled) == f"SELECT {expected}.a \nFROM {expected}"
+    # a quoted_name is one schema name, dots and all
+    dotted = Table("t", MetaData(), Column("a", Integer), schema=quoted_name("my.schema", True))
+    assert sql(select(dotted.c.a)) == 'SELECT "my.schema".t.a \nFROM "my.schema".t'
 
 
 def test_savepoints_are_refused_with_the_reason():

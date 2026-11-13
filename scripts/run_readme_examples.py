@@ -24,7 +24,7 @@ README = Path(__file__).resolve().parent.parent / "README.md"
 ADDRESS_IN_EXAMPLES = "localhost:31337"
 USERNAME, PASSWORD = "hardcharger", "change-me"
 EXPECTED_RUN = 7
-EXPECTED_NOT_RUN = 1
+EXPECTED_NOT_RUN = 2
 
 BLOCK = re.compile(
     r"(?P<marker><!-- not-run: [^>]*-->\n)?```python\n(?P<code>.*?)```\n"

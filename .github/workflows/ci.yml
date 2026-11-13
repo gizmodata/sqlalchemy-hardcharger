@@ -27,12 +27,9 @@ on:
       - "docs/**"
       - "LICENSE"
       - "NOTICE"
+  # Every pull request runs, documentation-only ones too: "CI result" is the check to require in
+  # branch protection, and a required check that never reports would block the merge.
   pull_request:
-    paths-ignore:
-      - "CHANGELOG.md"
-      - "docs/**"
-      - "LICENSE"
-      - "NOTICE"
   workflow_dispatch:
 
 permissions:
@@ -180,17 +177,25 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # the whole history: a release tag must be on main
       - uses: astral-sh/setup-uv@v10.3.2
         with:
           version: ${{ env.UV_VERSION_PIN }}
       - id: version
-        name: The version, its CHANGELOG section and (on a tag) the tag agree
+        name: The version, its CHANGELOG section and (on a tag) the tag agree; a tag is on main
         run: |
           set -euo pipefail
           version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' sqlalchemy_hardcharger/_version.py)
           if [ -z "$version" ]; then echo "::error::no version in sqlalchemy_hardcharger/_version.py"; exit 1; fi
-          if [[ "$GITHUB_REF" == refs/tags/v* ]] && [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME but the package version is $version"; exit 1
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+              echo "::error::tag $GITHUB_REF_NAME but the package version is $version"; exit 1
+            fi
+            git fetch --quiet origin main
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "::error::tag $GITHUB_REF_NAME is on a commit that is not on main"; exit 1
+            fi
           fi
           if ! grep -q "^## \[$version\]" CHANGELOG.md; then
             echo "::error::CHANGELOG.md has no section for $version"; exit 1

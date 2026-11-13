@@ -107,8 +107,9 @@ with Session(engine) as session:
 
 DuckDB has neither `SERIAL` nor identity columns, so the dialect gives such a key a sequence:
 `CREATE TABLE authors` is preceded by `CREATE SEQUENCE IF NOT EXISTS authors_id_seq`, the column
-gets `DEFAULT nextval('authors_id_seq')`, and dropping the table drops the sequence. `Identity(start=…,
-increment=…)` sets the sequence's options, and an explicit `Sequence("name")` is used as given.
+gets `DEFAULT nextval('authors_id_seq')`, and dropping the table drops the sequence. A column
+declared with `Identity(start=…, increment=…)` gets one too, key or not, with those options. An
+explicit `Sequence("name")` is used as given.
 
 ## Core: upserts and RETURNING
 
@@ -191,21 +192,39 @@ hardcharger://<user>:<password>@<host>[:<port>][/<catalog>][?option=value&...]
 | `tls_client_cert=`, `tls_client_key=` | | Client certificate and key for mutual TLS (PEM file paths) |
 | `tls_server_name=` | the host | Name to check the certificate against, when connecting by IP or through a tunnel |
 | `auth_type=` | `password` | `external`: sign in through a browser (SSO). `client_certificate`: sign in with the TLS client certificate |
-| `access_token=` | | A Hardcharger access token, in place of a user and password |
+| `access_token=` | | A Hardcharger access token, in place of a user and password (see the note on tokens below) |
 | `subject_token=` | | An identity provider's token, exchanged for an access token |
 | `oauth_timeout=` | `300` | Seconds to wait for the browser sign-in |
 | `open_browser=` | `true` | `false`: print the sign-in URL instead of opening a browser |
-| `share_sign_in=` | `true` with `auth_type=external` | One browser sign-in for the whole connection pool |
+| `share_sign_in=` | per engine, with `auth_type=external` | `false`: one browser sign-in per connection. A name: share the sign-in with other engines given the same name |
 | `resume_timeout=` | `600` | Seconds to wait for a stopped GizmoData Cloud cluster to start |
 | `session_tag=`, `query_tag=` | | JSON objects recorded with the session and its statements |
 | `hardcharger.<name>=` | | A session setting, e.g. `hardcharger.query_timeout=60` |
-| `adbc.<option>=` | | Any other option of the ADBC driver |
+| `adbc.chargewire.statement.*`, `adbc.chargewire.ipc_compression`, `adbc.chargewire.ingest.parts`, `adbc.chargewire.retry.max_attempts`, `adbc.chargewire.session.reconnect` | | Driver options that tune statements |
 
 An option the dialect doesn't know is an error, never ignored. Everything `connect()` of the driver
-takes can also be passed as `create_engine(url, connect_args={...})`: see the
+takes can be passed as `create_engine(url, connect_args={...})`: see the
 [driver's Python documentation](https://docs.hardcharger.gizmodata.com/clients/python/).
 
-Sign in through your identity provider (the browser opens once, for the whole pool):
+A URL is often configuration that someone other than the application's author supplies, so a URL
+can only choose among the options above: it can't name a program to run (the driver's browser
+command), adopt another session, or set a driver option outside that list. Those are for
+`connect_args`, in the application's own code.
+
+**Tokens.** SQLAlchemy hides a URL's password when it prints an engine or a URL, and nothing else:
+an `access_token=` or `subject_token=` in the URL shows in `repr(engine)` and in logs that print
+the URL. Pass a token in code instead:
+
+<!-- not-run: needs a token from a running server -->
+```python
+from sqlalchemy import create_engine
+
+engine = create_engine("hardcharger://db.example.com", connect_args={"access_token": token})
+```
+
+Sign in through your identity provider. The browser opens once per engine: the engine's pooled
+connections share the sign-in, and another engine in the same process (another user of the same
+application) gets its own.
 
 <!-- not-run: needs a server with single sign-on and a browser -->
 ```python
@@ -259,16 +278,17 @@ SQLAlchemy's generic types map to DuckDB's:
 | --- | --- | --- |
 | `Integer`, `BigInteger`, `SmallInteger` | `INTEGER`, `BIGINT`, `SMALLINT` | |
 | `Float`, `Double` | `DOUBLE` | A Python `float` is 8 bytes, so `Float` is a `DOUBLE`; `Float(precision=24)`, `FLOAT` or `REAL` ask for 4 bytes |
-| `Numeric(p, s)` | `DECIMAL(p, s)` | `Decimal` in Python |
+| `Numeric(p, s)` | `DECIMAL(p, s)` | `Decimal` in Python. `Numeric()` with no precision is DuckDB's `DECIMAL(18, 3)` |
 | `String`, `String(n)`, `Text` | `VARCHAR` | DuckDB keeps no length |
-| `Boolean`, `Date`, `Time`, `DateTime` | `BOOLEAN`, `DATE`, `TIME`, `TIMESTAMP` | |
-| `DateTime(timezone=True)` | `TIMESTAMP WITH TIME ZONE` | Returned in the session's time zone |
+| `Boolean`, `Date`, `Time`, `DateTime` | `BOOLEAN`, `DATE`, `TIME`, `TIMESTAMP` | A time-zone-aware value given to `DateTime()` keeps its wall-clock time and loses its offset, as on PostgreSQL |
+| `DateTime(timezone=True)` | `TIMESTAMP WITH TIME ZONE` | An aware value is that instant; a naive one is read in the session's time zone. Returned in the session's time zone |
+| `Time(timezone=True)` | `TIME WITH TIME ZONE` | Keeps its offset |
 | `Interval` | `INTERVAL` | `timedelta`; a month reads as 30 days |
 | `Uuid` | `UUID` | `uuid.UUID`, or text with `as_uuid=False` |
 | `LargeBinary` | `BLOB` | |
-| `JSON` | `JSON` | Keys, paths and typed access: `col["a"]`, `col[("a", 0)].as_integer()` |
+| `JSON` | `JSON` | Keys, paths and typed access: `col["a"]`, `col[("a", 0)].as_integer()`. A key is always taken literally, also one that starts with `$` or `/` |
 | `Enum("a", "b")` | `ENUM('a', 'b')` | With `name=`, a type of its own (`CREATE TYPE`) |
-| `ARRAY(Integer)` | `INTEGER[]` | A Python `list` |
+| `ARRAY(Integer)` | `INTEGER[]` | A Python `list`. A fixed-size `INTEGER[3]` reflects as a list |
 
 And DuckDB's own, from `sqlalchemy_hardcharger`: `TINYINT`, `UTINYINT`, `USMALLINT`, `UINTEGER`,
 `UBIGINT`, `HUGEINT`, `UHUGEINT`, `BIGNUM`, `TIMESTAMP_S`, `TIMESTAMP_MS`, `TIMESTAMP_NS`, `TIME_NS`,
@@ -303,7 +323,13 @@ with engine.begin() as conn:
 (A VARIANT object's keys come back in sorted order.)
 
 `Struct`, `Map` and `Union` columns read as Python values (`dict`, a list of pairs, the member's
-value) and are written with SQL expressions such as `func.struct_pack(...)`.
+value) and are written with SQL expressions such as `func.struct_pack(...)`. A VARIANT integer
+past 64 bits comes back as a float (it travels as JSON); `HUGEINT`, `UHUGEINT` and `BIGNUM` columns
+hold such integers exactly.
+
+Integer results are Python `int`s, including `sum()` over an integer column (a `HUGEINT` in
+DuckDB). Integer parameters are sent as `INTEGER`, so `func.round(column, 2)` and
+`date_column + 5` work as they do with a literal.
 
 ## Transactions and the connection pool
 
@@ -314,15 +340,27 @@ value) and are written with SQL expressions such as `func.struct_pack(...)`.
 - Two transactions that write the same rows conflict: the second gets an error and retries after a
   rollback. There are no row locks, so `SELECT ... FOR UPDATE` runs as a plain `SELECT`.
 - There are no savepoints: `begin_nested()` raises, with that reason.
-- A session the server ended (an administrator's `KILL SESSION`, an idle timeout) is treated as a
-  disconnect: the pool discards the connection and opens another.
+- The server ends a session that sits idle. The driver opens a new one for the next statement,
+  with the URL's catalog and schema current again, so an idle pool keeps working. A session whose
+  state was changed with `SET` or `USE` in SQL is not replaced silently: its next statement fails
+  as a disconnect, and the pool opens a fresh connection.
+- A session the server ended for good (an administrator's `KILL SESSION`, a revoked token) is
+  treated as a disconnect: the pool discards the connection and opens another.
+- Use the connection's `commit()` and `rollback()`. `BEGIN`, `COMMIT` and `ROLLBACK` sent as SQL
+  text are followed (a raw `BEGIN` on an `AUTOCOMMIT` connection is rolled back when the
+  connection returns to the pool), but only as whole statements of their own.
 - On a GizmoData Cloud cluster that stops when idle, leave `pool_pre_ping` off: a ping is a
   statement, and a statement starts the cluster.
 
 ## Alembic
 
 Migrations work with no extra setup: importing the dialect registers it with
-[Alembic](https://alembic.sqlalchemy.org). Each migration runs in a transaction.
+[Alembic](https://alembic.sqlalchemy.org). Each migration runs in a transaction. Autogenerate
+compares types as DuckDB stores them (`String(50)` and `Text` are both `VARCHAR`) and matches
+unique constraints by their columns, since DuckDB names constraints itself. `op.drop_table()`
+also drops the sequence that numbered the table's key. Operations DuckDB has no statement for
+fail as they would by hand: dropping or adding a constraint on an existing table, and altering a
+table that has an index (see below).
 
 ## Good to know about DuckDB
 
@@ -341,6 +379,8 @@ These are properties of DuckDB 2.0 that differ from PostgreSQL. Each is pinned b
 - **A table with an index** takes few alterations: adding a column works; renaming, retyping or
   dropping one needs the index dropped first.
 - **Generated columns** are virtual (`Computed(..., persisted=True)` is refused).
+- **One transaction writes to one catalog.** Writing to a second attached catalog in the same
+  transaction fails; commit between them.
 - **Bulk ORM inserts** that need server-generated keys back run one `INSERT ... RETURNING` per row,
   because DuckDB doesn't promise the order `RETURNING` gives a multi-row insert's rows in. Give the
   model a client-side key (`default=uuid.uuid4`) or use Core `insert()` with a list of rows where
