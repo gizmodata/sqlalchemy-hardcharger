@@ -2,9 +2,10 @@
 
 PYTHON ?= .venv/bin/python
 
+# --python: without it uv installs into the shell's active virtualenv, not the one made here.
 install:
 	uv venv
-	uv pip install -e ".[dev]"
+	uv pip install --python .venv/bin/python -e ".[dev]"
 
 lint:
 	$(PYTHON) -m ruff check .

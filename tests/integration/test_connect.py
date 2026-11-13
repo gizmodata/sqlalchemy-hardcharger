@@ -53,9 +53,12 @@ def test_path_and_schema_option_choose_the_catalog_and_schema(engine, server, na
         conn.execute(text(f"CREATE SCHEMA {name}.reports"))
     try:
         url = server_url(server=server, schema="reports").set(database=name)
-        assert scalar(url=url, sql="SELECT current_catalog() || '.' || current_schema()") == (
-            f"{name}.reports"
-        )
+        # Many connects, not one: a driver before adbc-driver-hardcharger 2.5.0 applied the two
+        # options in a random order, so one connect in five or so found the schema by luck.
+        for _ in range(40):
+            assert scalar(url=url, sql="SELECT current_catalog() || '.' || current_schema()") == (
+                f"{name}.reports"
+            )
         url = server_url(server=server, catalog=name)
         assert scalar(url=url, sql="SELECT current_catalog()") == name
     finally:

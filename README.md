@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/gizmodata/sqlalchemy-hardcharger/actions/workflows/ci.yml"><img src="https://github.com/gizmodata/sqlalchemy-hardcharger/actions/workflows/ci.yml/badge.svg" alt="CI: full suite on Python 3.11–3.15"></a>
   <a href="https://pypi.org/project/sqlalchemy-hardcharger/"><img src="https://img.shields.io/pypi/v/sqlalchemy-hardcharger?logo=pypi" alt="PyPI version"></a>
-  <a href="https://pypi.org/project/sqlalchemy-hardcharger/"><img src="https://img.shields.io/badge/Python-3.11–3.15-3776AB?logo=python&amp;logoColor=white" alt="Python 3.11–3.15"></a>
+  <a href="https://pypi.org/project/sqlalchemy-hardcharger/"><img src="https://img.shields.io/badge/Python-3.10–3.15-3776AB?logo=python&amp;logoColor=white" alt="Python 3.10–3.15"></a>
   <a href="https://pypi.org/project/sqlalchemy-hardcharger/"><img src="https://img.shields.io/pepy/dt/sqlalchemy-hardcharger.svg" alt="PyPI downloads"></a>
   <a href="https://www.sqlalchemy.org"><img src="https://img.shields.io/badge/SQLAlchemy-2.0%20%7C%202.1-D71F00.svg?logo=sqlalchemy&amp;logoColor=white" alt="SQLAlchemy 2.0 and 2.1"></a>
   <a href="https://github.com/gizmodata/hardcharger-adbc"><img src="https://img.shields.io/badge/driver-Hardcharger%20ADBC-f15a24.svg" alt="Hardcharger ADBC driver"></a>
@@ -38,7 +38,8 @@ the native [Hardcharger ADBC driver](https://github.com/gizmodata/hardcharger-ad
 pip install sqlalchemy-hardcharger
 ```
 
-Python **3.11 or later**, SQLAlchemy **2.0 or 2.1**. Installs `adbc-driver-hardcharger>=2.4.9,<3`.
+Python **3.10 or later**, SQLAlchemy **2.0 or 2.1** (SQLAlchemy 2.1 itself needs Python 3.11, so
+Python 3.10 gets 2.0). Installs `adbc-driver-hardcharger>=2.5.0,<3`.
 
 ## Quick start
 
@@ -427,7 +428,7 @@ runs it on a free port; `HARDCHARGER_SERVER_BINARY` names another build to test.
 required: the integration tests, the compliance suite and the README examples fail, never skip,
 when it can't start.
 
-CI runs all of it on Python 3.11–3.15 and on both SQLAlchemy series, once more with the lowest
+CI runs all of it on Python 3.10–3.15 and on both SQLAlchemy series, once more with the lowest
 dependency versions `pyproject.toml` allows, and publishes from version tags with PyPI Trusted
 Publishing only after every job has passed on the tagged commit. See
 [release setup](docs/releasing.md).

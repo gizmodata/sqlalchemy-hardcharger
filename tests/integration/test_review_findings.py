@@ -64,7 +64,7 @@ def test_naive_timestamps_store_the_wall_clock_whatever_the_batch(tokyo_engine, 
     )
     metadata.create_all(bind=tokyo_engine)
     naive = datetime.datetime(2024, 1, 1, 12, 0)
-    aware = datetime.datetime(2024, 1, 1, 12, 0, tzinfo=datetime.UTC)
+    aware = datetime.datetime(2024, 1, 1, 12, 0, tzinfo=datetime.timezone.utc)
     with tokyo_engine.begin() as conn:
         conn.execute(table.insert(), [{"id": 1, "at": aware}])  # alone
         conn.execute(table.insert(), [{"id": 2, "at": naive}, {"id": 3, "at": aware}])  # mixed
@@ -92,7 +92,7 @@ def test_zoned_timestamps_store_the_instant_whatever_the_batch(tokyo_engine, met
     )
     metadata.create_all(bind=tokyo_engine)
     naive = datetime.datetime(2024, 1, 1, 12, 0)  # read in the session's zone: 12:00 Tokyo
-    aware = datetime.datetime(2024, 1, 1, 12, 0, tzinfo=datetime.UTC)  # 21:00 Tokyo
+    aware = datetime.datetime(2024, 1, 1, 12, 0, tzinfo=datetime.timezone.utc)  # 21:00 Tokyo
     with tokyo_engine.begin() as conn:
         conn.execute(table.insert(), [{"id": 1, "at": aware}])
         conn.execute(table.insert(), [{"id": 2, "at": naive}])
@@ -123,7 +123,7 @@ def test_time_with_time_zone_keeps_its_offset(engine, metadata, name):
     metadata.create_all(bind=engine)
     india = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
     values = [
-        datetime.time(12, 0, tzinfo=datetime.UTC),
+        datetime.time(12, 0, tzinfo=datetime.timezone.utc),
         datetime.time(12, 0, tzinfo=india),
         datetime.time(1, 2, 3, 456789, tzinfo=datetime.timezone(datetime.timedelta(hours=-8))),
         None,

@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-13
+
+### Added
+
+- **Python 3.10** is supported (was 3.11 or later), with SQLAlchemy 2.0: SQLAlchemy 2.1 itself
+  needs Python 3.11. The Hardcharger ADBC driver installs on Python 3.10 from 2.5.0. CI runs every
+  suite on Python 3.10, and the lowest-versions job now runs there.
+
+### Changed
+
+- Requires `adbc-driver-hardcharger` 2.5.0 or newer (was 2.4.9). That driver applies a catalog and
+  a schema given together at connect in that order; earlier ones usually applied the schema first,
+  in the server's default catalog. A URL with both (`hardcharger://host/lake?schema=reports`) now
+  passes both to the driver, where 1.0.0 connected with the catalog and set the schema afterwards.
+  The connection starts in the same place as before.
+
 ## [1.0.0] - 2026-11-13
 
 ### Added

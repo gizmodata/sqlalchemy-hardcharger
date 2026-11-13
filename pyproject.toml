@@ -9,7 +9,7 @@ description = "SQLAlchemy dialect for Hardcharger, GizmoData's DuckDB 2.0 server
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 authors = [{ name = "Philip Moore", email = "philip@gizmodata.com" }]
 keywords = ["sqlalchemy", "dialect", "hardcharger", "duckdb", "adbc", "arrow", "chargewire"]
 classifiers = [
@@ -17,6 +17,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -33,7 +34,9 @@ dependencies = [
     # series are supported: the floor is the 2.0 series' latest release. CI's lowest-versions
     # job installs exactly these floors.
     "sqlalchemy>=2.0.57,<2.2",
-    "adbc-driver-hardcharger>=2.4.9,<3",
+    # 2.5.0 applies a catalog and a schema given together at connect in that order (earlier
+    # releases usually applied the schema first), and is the first to install on Python 3.10.
+    "adbc-driver-hardcharger>=2.5.0,<3",
 ]
 
 [project.optional-dependencies]
@@ -41,7 +44,9 @@ dev = [
     "hardcharger>=2.12.0",
     "pytest>=9.2.0",
     "alembic>=1.20.1",
-    "pandas>=3.1.1",
+    "pandas>=3.1.1; python_version >= '3.11'",
+    # pandas 3 needs Python 3.11; this is the last 2.x release.
+    "pandas>=2.3.3; python_version < '3.11'",
     "cryptography>=50.0.2",
     "ruff>=0.17.5",
     "mypy>=2.4.1",
@@ -76,13 +81,13 @@ testpaths = ["tests/unit", "tests/integration"]
 addopts = "-ra"
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.10"
 warn_unused_configs = true
 ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "B", "UP"]

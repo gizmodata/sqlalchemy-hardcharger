@@ -29,7 +29,7 @@ from sqlalchemy_hardcharger import (
     Union,
 )
 
-UTC = datetime.UTC
+UTC = datetime.timezone.utc
 
 # (id, column type, a value, the class the column reflects as)
 CASES = [

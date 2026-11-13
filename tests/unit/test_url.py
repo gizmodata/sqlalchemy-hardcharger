@@ -230,38 +230,15 @@ def test_an_explicit_sign_in_choice_is_kept(given, expected):
     assert dialect.dbapi.calls == [{"uri": "hardcharger://h", **expected}]
 
 
-class _RecordingAdbcConnection:
-    def __init__(self):
-        self.options = []
-
-    def set_options(self, **options):
-        self.options.append(options)
-
-
-class _RecordingConnection:
-    def __init__(self):
-        self.adbc_connection = _RecordingAdbcConnection()
-        self.statements = []
-
-    def cursor(self):
-        raise AssertionError("no SQL is to be sent at connect")
-
-
-def test_a_schema_of_a_named_catalog_is_set_as_a_driver_option_after_connecting():
-    """Not with USE in SQL: the driver re-applies options when the server replaces an idle
-    session, and refuses to replace one whose state was set in SQL."""
+def test_a_catalog_and_a_schema_go_to_the_driver_together():
+    """The driver applies the catalog first (adbc-driver-hardcharger 2.5.0), so the dialect
+    passes both as given: no option set after connecting, and no SQL sent at connect."""
     dialect = HardchargerDialect()
     dialect.dbapi = _FakeDbapi()
-    driver_connection = _RecordingConnection()
-
-    def connect(**kwargs):
-        dialect.dbapi.calls.append(kwargs)
-        return driver_connection
-
-    dialect.dbapi.connect = connect
     dialect.connect(uri="hardcharger://h", catalog="Lake", db_schema="my sales")
-    assert dialect.dbapi.calls == [{"uri": "hardcharger://h", "catalog": "Lake"}]
-    assert driver_connection.adbc_connection.options == [{"adbc.connection.db_schema": "my sales"}]
+    assert dialect.dbapi.calls == [
+        {"uri": "hardcharger://h", "catalog": "Lake", "db_schema": "my sales"}
+    ]
 
 
 def test_a_schema_alone_is_left_to_the_driver():

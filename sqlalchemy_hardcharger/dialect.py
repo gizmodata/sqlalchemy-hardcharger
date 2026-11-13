@@ -808,21 +808,10 @@ class HardchargerDialect(PGDialect):
         if cparams.get("auth_type") == "external":
             # One browser sign-in for this engine's pool, not one window per pooled connection.
             cparams.setdefault("share_sign_in", self._sign_in_scope)
-        # The driver applies a schema before the catalog (adbc-driver-hardcharger 2.4.9), so a
-        # schema of a catalog that isn't the server's default is "not found". When both are
-        # given, connect with the catalog and then set the schema, as a connection option (not
-        # with USE in SQL): the driver keeps options and re-applies them when the server replaces
-        # an idle session, which it refuses to do after session state was set in SQL.
-        schema_name = cparams.pop("db_schema", None) if cparams.get("catalog") else None
+        # A catalog and a schema given together go to the driver as they are: it applies the
+        # catalog first (adbc-driver-hardcharger 2.5.0; earlier releases usually applied the
+        # schema first, in the server's default catalog).
         driver_connection = self.loaded_dbapi.connect(*cargs, **cparams)
-        if schema_name is not None:
-            try:
-                driver_connection.adbc_connection.set_options(
-                    **{"adbc.connection.db_schema": schema_name}
-                )
-            except Exception:
-                driver_connection.close()
-                raise
         return HardchargerConnection(driver_connection=driver_connection)
 
     def get_driver_connection(self, connection: Any) -> Any:

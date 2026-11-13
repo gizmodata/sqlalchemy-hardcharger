@@ -90,7 +90,7 @@ def tls_files(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
     directory = tmp_path_factory.mktemp("tls")
     key = ec.generate_private_key(curve=ec.SECP256R1())
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "sqlalchemy-hardcharger test")])
-    now = datetime.datetime.now(tz=datetime.UTC)
+    now = datetime.datetime.now(tz=datetime.timezone.utc)
     certificate = (
         x509.CertificateBuilder()
         .subject_name(subject)

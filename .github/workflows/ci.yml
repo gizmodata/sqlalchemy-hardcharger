@@ -4,7 +4,7 @@ name: CI
 # all of it on the tagged commit and publishes only if every job passed.
 #
 #   - lint: ruff check, ruff format --check, mypy;
-#   - test: on Python 3.11 to 3.15, the unit tests, the integration tests, SQLAlchemy's own
+#   - test: on Python 3.10 to 3.15, the unit tests, the integration tests, SQLAlchemy's own
 #     dialect compliance suite and every README example, against a real hardcharger-server (the
 #     `hardcharger` package downloads the released binary and runs it on a free port). With the
 #     newest SQLAlchemy on each Python, and with the SQLAlchemy 2.0 series on the newest Python;
@@ -111,6 +111,9 @@ jobs:
         include:
           - python: "3.15"
             sqlalchemy: "2.0"
+          # SQLAlchemy 2.1 needs Python 3.11, so Python 3.10 is SQLAlchemy 2.0 only.
+          - python: "3.10"
+            sqlalchemy: "2.0"
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.2
@@ -155,16 +158,23 @@ jobs:
           version: ${{ env.UV_VERSION_PIN }}
       - name: Install exactly the floors in pyproject.toml
         run: |
-          uv venv --python 3.11
+          uv venv --python 3.10
           uv pip install --resolution lowest-direct -e ".[dev]"
           .venv/bin/python - <<'PY'
-          import re, sys, tomllib
-          from importlib.metadata import version
+          import re, sys
+          from importlib.metadata import requires, version
 
-          project = tomllib.load(open("pyproject.toml", "rb"))["project"]
+          floor = re.search(r'^requires-python = ">=([0-9.]+)"', open("pyproject.toml").read(), re.M).group(1)
+          running = "%d.%d" % sys.version_info[:2]
+          print(f"python: floor {floor}, running {running}")
+          if running != floor:
+              sys.exit(f"requires-python's floor is {floor}, but this job runs Python {running}")
           wrong = []
-          for requirement in project["dependencies"]:
-              name, floor = re.match(r"([A-Za-z0-9_.-]+)>=([0-9.]+)", requirement).groups()
+          # The package's own requirements, without the extras' (tomllib is Python 3.11's).
+          for requirement in [r for r in requires("sqlalchemy-hardcharger") if "extra ==" not in r]:
+              # Built metadata orders the specifiers its own way ("sqlalchemy<2.2,>=2.0.57").
+              name = re.match(r"[A-Za-z0-9_.-]+", requirement).group(0)
+              floor = re.search(r">=([0-9.]+)", requirement).group(1)
               installed = version(name)
               print(f"{name}: floor {floor}, installed {installed}")
               if installed != floor:
@@ -235,7 +245,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          uv venv --python 3.11 /tmp/clean
+          uv venv --python 3.10 /tmp/clean
           uv pip install --python /tmp/clean/bin/python dist/*.whl
           cd /tmp
           /tmp/clean/bin/python - <<'PY'
