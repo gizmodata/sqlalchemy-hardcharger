@@ -200,8 +200,8 @@ hardcharger://<user>:<password>@<host>[:<port>][/<catalog>][?option=value&...]
 | `share_sign_in=` | per engine, with `auth_type=external` | `false`: one browser sign-in per connection. A name: share the sign-in with other engines given the same name |
 | `resume_timeout=` | `600` | Seconds to wait for a stopped GizmoData Cloud cluster to start |
 | `session_tag=`, `query_tag=` | | JSON objects recorded with the session and its statements |
-| `hardcharger.<name>=` | | A session setting, e.g. `hardcharger.query_timeout=60` |
-| `adbc.chargewire.statement.*`, `adbc.chargewire.ipc_compression`, `adbc.chargewire.ingest.parts`, `adbc.chargewire.retry.max_attempts`, `adbc.chargewire.session.reconnect` | | Driver options that tune statements |
+| `hardcharger.<name>=` | | A session setting (a name without a dot), e.g. `hardcharger.query_timeout=60` |
+| `hardcharger.query.async`, `hardcharger.query.retain_result`, `hardcharger.query.timeout_seconds`, `hardcharger.query.result_partitions`, `hardcharger.query.result_order`, `hardcharger.ipc.compression`, `hardcharger.ingest.parts`, `hardcharger.retry.max_attempts`, `hardcharger.session.reconnect` | | Driver options that tune statements, by these exact names. Their names from before adbc-driver-hardcharger 2.7.0 (`adbc.chargewire.statement.result_partitions`, ...) still work, with a `DeprecationWarning` |
 
 An option the dialect doesn't know is an error, never ignored. Everything `connect()` of the driver
 takes can be passed as `create_engine(url, connect_args={...})`: see the
@@ -209,8 +209,9 @@ takes can be passed as `create_engine(url, connect_args={...})`: see the
 
 A URL is often configuration that someone other than the application's author supplies, so a URL
 can only choose among the options above: it can't name a program to run (the driver's browser
-command), adopt another session, or set a driver option outside that list. Those are for
-`connect_args`, in the application's own code.
+command), adopt another session, or set a driver option outside that list, under any spelling
+(`hardcharger.*`, `chargewire.*` or the older `adbc.*`). Those are for `connect_args`, in the
+application's own code.
 
 **Tokens.** SQLAlchemy hides a URL's password when it prints an engine or a URL, and nothing else:
 an `access_token=` or `subject_token=` in the URL shows in `repr(engine)` and in logs that print

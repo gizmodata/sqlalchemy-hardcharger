@@ -6,6 +6,28 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Requires `adbc-driver-hardcharger` 2.7.0 or newer (was 2.5.0), whose option names follow the
+  ADBC driver style guide (`hardcharger.*` instead of `adbc.chargewire.*`/`adbc.hardcharger.*`).
+  The driver options a URL may set are now `hardcharger.query.async`,
+  `hardcharger.query.retain_result`, `hardcharger.query.timeout_seconds`,
+  `hardcharger.query.result_partitions`, `hardcharger.query.result_order`,
+  `hardcharger.ipc.compression`, `hardcharger.ingest.parts`, `hardcharger.retry.max_attempts` and
+  `hardcharger.session.reconnect`. Their old names still work in a URL: the dialect hands the
+  driver the new name (so the driver prints no deprecation line) and raises a
+  `DeprecationWarning`. A URL that gives one option under two names is refused.
+
+### Security
+
+- Every other driver option stays out of a URL under every spelling the 2.7.0 driver reads
+  (`hardcharger.*`, `chargewire.*`, `adbc.hardcharger.*`, `adbc.chargewire.*`, `adbc.warp.*`):
+  the browser command, TLS files, tokens, session ids and the rest are for `connect_args`. A
+  dotted `hardcharger.X` URL key is never taken for a session setting (setting names have no dot),
+  so `?hardcharger.oauth.browser=` is refused by the dialect instead of reaching the driver.
+  Tests sweep every option name the driver knows, and check that passwords with `;)"'@:/%`,
+  spaces, backslashes and non-ASCII characters sign in and never appear in an error.
+
 ## [1.1.0] - 2026-11-13
 
 ### Added

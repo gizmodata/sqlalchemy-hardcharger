@@ -1,6 +1,7 @@
 """hardcharger:// URLs -> the driver's connect() arguments. No server needed."""
 
 import pytest
+from adbc_driver_hardcharger import DatabaseOptions
 from sqlalchemy import create_engine, exc
 from sqlalchemy.engine import make_url
 
@@ -60,6 +61,9 @@ def test_an_option_error_never_repeats_the_value():
         "hardcharger://h?oauth_timeout=tok_SECRET",
         "hardcharger://h?open_browser=tok_SECRET",
         "hardcharger://h?adbc.chargewire.auth.access_token=tok_SECRET",
+        "hardcharger://h?hardcharger.auth.access_token=tok_SECRET",
+        "hardcharger://h?chargewire.auth.access_token=tok_SECRET",
+        "hardcharger://h?hardcharger.session.id=tok_SECRET",
         "hardcharger://h?bogus=tok_SECRET",
     ):
         with pytest.raises(exc.ArgumentError) as caught:
@@ -135,6 +139,13 @@ def test_a_url_cannot_name_a_program_to_run():
         "adbc.chargewire.auth.access_token",
         "adbc.chargewire.tls.skip_verify",
         "adbc.something.new",
+        "hardcharger.oauth.browser",
+        "hardcharger.oauth.sign_in_key",
+        "hardcharger.session.id",
+        "hardcharger.auth.access_token",
+        "hardcharger.tls.skip_verify",
+        "chargewire.oauth.browser",
+        "chargewire.something.new",
     ):
         with pytest.raises(exc.ArgumentError, match="can't be set in a URL"):
             connect_args(f"hardcharger://h?{option}=x")
@@ -147,11 +158,11 @@ def test_connect_args_still_take_everything_the_driver_does():
         uri="hardcharger://h",
         auth_type="external",
         open_browser="my-browser --new-window",
-        db_kwargs={"adbc.chargewire.session.id": "s_1"},
+        db_kwargs={DatabaseOptions.SESSION_ID.value: "s_1"},
     )
     (call,) = dialect.dbapi.calls
     assert call["open_browser"] == "my-browser --new-window"
-    assert call["db_kwargs"] == {"adbc.chargewire.session.id": "s_1"}
+    assert call["db_kwargs"] == {"hardcharger.session.id": "s_1"}
 
 
 def test_number_options_must_be_numbers():
@@ -159,12 +170,12 @@ def test_number_options_must_be_numbers():
         connect_args("hardcharger://h?oauth_timeout=soon")
 
 
-def test_hardcharger_settings_and_adbc_options():
+def test_hardcharger_settings_and_driver_options():
     kwargs = connect_args(
-        "hardcharger://h?hardcharger.query_timeout=60&adbc.chargewire.statement.result_partitions=1"
+        "hardcharger://h?hardcharger.query_timeout=60&hardcharger.query.result_partitions=1"
     )
     assert kwargs["settings"] == {"query_timeout": "60"}
-    assert kwargs["db_kwargs"] == {"adbc.chargewire.statement.result_partitions": "1"}
+    assert kwargs["db_kwargs"] == {"hardcharger.query.result_partitions": "1"}
 
 
 def test_an_unknown_option_is_refused_not_dropped():

@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import re
 import uuid
+import warnings
 from typing import Any
 
+from adbc_driver_hardcharger import DatabaseOptions, StatementOptions
 from sqlalchemy import exc, pool, schema, text, util
 from sqlalchemy import types as sqltypes
 from sqlalchemy.dialects import postgresql
@@ -80,22 +82,42 @@ _TRANSACTION_CONTROL = re.compile(
     flags=re.IGNORECASE | re.DOTALL,
 )
 
-# Driver options a URL may set. Everything else under adbc.* is refused in a URL, because a URL
-# is often configuration that someone else supplies, and other driver options name programs to
-# run (the browser command) or sessions and tokens to adopt. They remain available to the
-# application's own code through create_engine(connect_args={"db_kwargs": {...}}).
+# Driver options a URL may set, by their exact names: only ones that tune statements and
+# transfers. Every other driver option is refused in a URL, under any spelling (hardcharger.*,
+# chargewire.*, adbc.*), because a URL is often configuration that someone else supplies, and
+# other driver options name programs to run (the browser command), files to read, or sessions
+# and tokens to adopt. They remain available to the application's own code through
+# create_engine(connect_args={"db_kwargs": {...}}).
 _ADBC_URL_OPTIONS = (
-    "adbc.chargewire.statement.async",
-    "adbc.chargewire.statement.retain_result",
-    "adbc.chargewire.statement.timeout_seconds",
-    "adbc.chargewire.statement.result_partitions",
-    "adbc.chargewire.statement.result_order",
-    "adbc.chargewire.ipc_compression",
-    "adbc.chargewire.ingest.parts",
-    "adbc.hardcharger.ingest.parts",
-    "adbc.chargewire.retry.max_attempts",
-    "adbc.chargewire.session.reconnect",
+    StatementOptions.ASYNC.value,
+    StatementOptions.RETAIN_RESULT.value,
+    StatementOptions.TIMEOUT_SECONDS.value,
+    StatementOptions.RESULT_PARTITIONS.value,
+    StatementOptions.RESULT_ORDER.value,
+    StatementOptions.IPC_COMPRESSION.value,
+    StatementOptions.INGEST_PARTS.value,
+    DatabaseOptions.RETRY_MAX_ATTEMPTS.value,
+    DatabaseOptions.SESSION_RECONNECT.value,
 )
+
+# The names those options had before adbc-driver-hardcharger 2.7.0 (the ADBC driver style
+# guide's renaming): a URL may still use them, and the dialect hands the driver the current
+# name. Nothing else under the old names is accepted in a URL.
+_ADBC_URL_OPTIONS_RENAMED = {
+    "adbc.chargewire.statement.async": StatementOptions.ASYNC.value,
+    "adbc.chargewire.statement.retain_result": StatementOptions.RETAIN_RESULT.value,
+    "adbc.chargewire.statement.timeout_seconds": StatementOptions.TIMEOUT_SECONDS.value,
+    "adbc.chargewire.statement.result_partitions": StatementOptions.RESULT_PARTITIONS.value,
+    "adbc.chargewire.statement.result_order": StatementOptions.RESULT_ORDER.value,
+    "adbc.chargewire.ipc_compression": StatementOptions.IPC_COMPRESSION.value,
+    "adbc.chargewire.ingest.parts": StatementOptions.INGEST_PARTS.value,
+    "adbc.hardcharger.ingest.parts": StatementOptions.INGEST_PARTS.value,
+    "adbc.chargewire.retry.max_attempts": DatabaseOptions.RETRY_MAX_ATTEMPTS.value,
+    "adbc.chargewire.session.reconnect": DatabaseOptions.SESSION_RECONNECT.value,
+}
+
+# Prefixes under which a URL key names a driver option (refused unless allowlisted above).
+_DRIVER_OPTION_PREFIXES = ("adbc.", "chargewire.")
 
 # A temporary table or view hides a permanent one of the same name, in reflection as in a query:
 # when the session has a temporary object called :hc_table, only its rows are the answer.
@@ -139,6 +161,20 @@ def _as_float(name: str, value: str) -> float:
 
 def _as_text(name: str, value: str) -> str:
     return value
+
+
+def _names_driver_option(name: str) -> bool:
+    """Whether a ``hardcharger.X`` URL key names a driver option rather than a session setting.
+
+    A setting's name has no dot (``hardcharger.query_timeout``; the driver also takes
+    ``hardcharger.hardcharger.query_timeout``), while every driver option under ``hardcharger.``
+    has one (``hardcharger.oauth.browser``, ``hardcharger.setting.query_timeout``), so a dotted
+    name is a driver option and is never sent as a setting.
+    """
+    setting = name[len("hardcharger.") :]
+    if setting.startswith("hardcharger."):
+        setting = setting[len("hardcharger.") :]
+    return "." in setting
 
 
 # URL query option -> (connect() keyword, converter)
@@ -736,10 +772,13 @@ class HardchargerDialect(PGDialect):
         TLS is on unless ``?tls=false``. The path names the catalog to make current, and
         ``?schema=`` the schema. The other options are ``connect()`` keywords of the Hardcharger
         ADBC driver (``auth_type``, ``access_token``, ``tls_skip_verify``, ``tls_root_certs``,
-        ...); ``hardcharger.<name>`` is a session setting, and a few ``adbc.<...>`` driver
-        options that tune statements are accepted. Anything else is refused, never dropped: in
-        particular nothing in a URL can name a program to run. ``connect_args`` takes everything
-        the driver's ``connect()`` does.
+        ...); ``hardcharger.<name>`` (a name without a dot) is a session setting, and a few
+        driver options that tune statements are accepted by their exact names
+        (``hardcharger.query.result_partitions``, ...; their names from before
+        adbc-driver-hardcharger 2.7.0 too, ``adbc.chargewire.statement.result_partitions``, ...).
+        Anything else is refused, never dropped: in particular nothing in a URL can name a program
+        to run or a session to adopt. ``connect_args`` takes everything the driver's ``connect()``
+        does.
         """
         kwargs: dict[str, Any] = {}
         query: dict[str, str] = {}
@@ -772,7 +811,11 @@ class HardchargerDialect(PGDialect):
 
         settings: dict[str, str] = {}
         db_kwargs: dict[str, str] = {}
+        given_as: dict[str, str] = {}
         for name, value in query.items():
+            # The order matters: the driver's option names share the hardcharger. prefix with
+            # session settings, so the allowlisted option names are matched (exactly) first,
+            # and every other dotted hardcharger.X is refused, never taken for a setting.
             if name == "catalog":
                 if kwargs.get("catalog", value) != value:
                     raise exc.ArgumentError(
@@ -782,11 +825,24 @@ class HardchargerDialect(PGDialect):
             elif name in _URL_OPTIONS:
                 keyword, convert = _URL_OPTIONS[name]
                 kwargs[keyword] = convert(name, value)
-            elif name.startswith("hardcharger."):
+            elif name in _ADBC_URL_OPTIONS or name in _ADBC_URL_OPTIONS_RENAMED:
+                option = _ADBC_URL_OPTIONS_RENAMED.get(name, name)
+                if option in given_as:
+                    raise exc.ArgumentError(
+                        f"the URL sets the driver option {option!r} twice, as "
+                        f"{given_as[option]!r} and {name!r}: give it once"
+                    )
+                if option != name:
+                    warnings.warn(
+                        f"the URL option {name!r} is deprecated; use {option!r}",
+                        category=DeprecationWarning,
+                        stacklevel=2,
+                    )
+                given_as[option] = name
+                db_kwargs[option] = value
+            elif name.startswith("hardcharger.") and not _names_driver_option(name=name):
                 settings[name[len("hardcharger.") :]] = value
-            elif name in _ADBC_URL_OPTIONS:
-                db_kwargs[name] = value
-            elif name.startswith("adbc."):
+            elif name.startswith("hardcharger.") or name.startswith(_DRIVER_OPTION_PREFIXES):
                 raise exc.ArgumentError(
                     f"the driver option {name!r} can't be set in a URL: pass it in "
                     'create_engine(url, connect_args={"db_kwargs": {...}}). In a URL: '

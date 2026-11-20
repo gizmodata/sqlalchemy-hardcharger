@@ -83,6 +83,72 @@ def test_hardcharger_settings_in_the_url_apply_to_the_session(server):
         engine.dispose()
 
 
+def test_driver_options_in_the_url_reach_the_driver_by_their_names(server, capfd):
+    url = server_url(
+        server=server,
+        **{"hardcharger.query.result_partitions": "1", "hardcharger.ingest.parts": "1"},
+    )
+    engine = create_engine(url=url)
+    try:
+        with engine.connect() as conn:
+            database = conn.connection.driver_connection.adbc_database
+            assert database.get_option("hardcharger.query.result_partitions") == "1"
+            assert database.get_option("hardcharger.ingest.parts") == "1"
+            assert conn.execute(text("SELECT 1")).scalar() == 1
+    finally:
+        engine.dispose()
+    assert "deprecated" not in capfd.readouterr().err
+
+
+def test_a_driver_option_under_its_old_name_in_the_url_still_works(server, capfd):
+    """The dialect hands the driver the current name: the driver prints no deprecation line,
+    and the URL's author gets a DeprecationWarning instead."""
+    url = server_url(server=server, **{"adbc.chargewire.statement.result_partitions": "1"})
+    with pytest.warns(DeprecationWarning, match="hardcharger.query.result_partitions"):
+        engine = create_engine(url=url)
+    try:
+        with engine.connect() as conn:
+            database = conn.connection.driver_connection.adbc_database
+            assert database.get_option("hardcharger.query.result_partitions") == "1"
+    finally:
+        engine.dispose()
+    assert "deprecated" not in capfd.readouterr().err
+
+
+def test_a_url_cannot_run_the_browser_command(server, tmp_path):
+    """Whatever spelling it uses, a browser command in a URL is refused before anything runs."""
+    marker = tmp_path / "marker"
+    for key in (
+        "hardcharger.oauth.browser",
+        "chargewire.oauth.browser",
+        "adbc.hardcharger.oauth.browser",
+        "adbc.chargewire.oauth.browser",
+    ):
+        url = server_url(server=server, auth_type="external", **{key: f"touch {marker}"})
+        with pytest.raises(exc.ArgumentError, match="can't be set in a URL"):
+            scalar(url=url.set(username=None, password=None), sql="SELECT 1")
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "password", ["p;)\"'@:/% \\n\u00f6\u20ac", "%2F%40already-encoded", "?q=1&x=y#frag"]
+)
+def test_a_password_with_punctuation_signs_in_and_stays_out_of_errors(password):
+    with hardcharger.Server(username="sa_punct", password=password) as punct:
+        url = server_url(server=punct)
+        # as a URL object, and as the string a configuration file would hold
+        for spelled in (url, url.render_as_string(hide_password=False)):
+            assert scalar(url=spelled, sql="SELECT HARDCHARGER_USER()") == "sa_punct"
+        wrong = url.set(password=password + "x")
+        with pytest.raises(exc.DBAPIError, match="invalid_credentials") as caught:
+            scalar(url=wrong.render_as_string(hide_password=False), sql="SELECT 1")
+        assert password not in str(caught.value)
+        missing = url.set(database="no_such_catalog")
+        with pytest.raises(exc.DBAPIError, match="no_such_catalog") as caught:
+            scalar(url=missing, sql="SELECT 1")
+        assert password not in str(caught.value)
+
+
 def test_connect_args_reach_the_driver(server):
     engine = create_engine(
         url=server_url(server=server),
