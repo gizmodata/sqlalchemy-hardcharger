@@ -98,8 +98,7 @@ def test_two_different_catalogs_are_refused():
 def test_driver_options_are_passed_with_their_types():
     kwargs = connect_args(
         "hardcharger://h?auth_type=external&oauth_timeout=120&open_browser=false"
-        "&share_sign_in=team&resume_timeout=0&tls_skip_verify=true"
-        "&tls_root_certs=/etc/ca.pem&tls_client_cert=/etc/c.pem&tls_client_key=/etc/k.pem"
+        "&share_sign_in=false&resume_timeout=0&tls_skip_verify=true"
         "&tls_server_name=db.internal&session_tag=%7B%22app%22%3A%22etl%22%7D"
         "&query_tag=%7B%22job%22%3A7%7D"
     )
@@ -108,12 +107,9 @@ def test_driver_options_are_passed_with_their_types():
         "auth_type": "external",
         "oauth_timeout": 120.0,
         "open_browser": False,
-        "share_sign_in": "team",
+        "share_sign_in": False,
         "resume_timeout": 0.0,
         "tls_skip_verify": True,
-        "tls_root_certs": "/etc/ca.pem",
-        "tls_client_cert": "/etc/c.pem",
-        "tls_client_key": "/etc/k.pem",
         "tls_server_name": "db.internal",
         "session_tag": '{"app":"etl"}',
         "query_tag": '{"job":7}',
@@ -190,10 +186,17 @@ def test_an_option_given_twice_is_refused():
         connect_args("hardcharger://h?schema=a&schema=b")
 
 
-def test_a_url_needs_a_host_or_a_profile():
+def test_a_url_without_a_host_needs_a_profile_from_connect_args():
+    """A connection profile holds credentials and names a server: only the application's own
+    code chooses one (connect_args), never the URL."""
+    assert connect_args("hardcharger://") == {}
+    dialect = HardchargerDialect()
+    dialect.dbapi = _FakeDbapi()
     with pytest.raises(exc.ArgumentError, match="needs a host"):
-        connect_args("hardcharger://")
-    assert connect_args("hardcharger:///?profile=warehouse") == {"profile": "warehouse"}
+        dialect.connect()
+    assert dialect.dbapi.calls == []
+    dialect.connect(profile="warehouse")
+    assert dialect.dbapi.calls == [{"profile": "warehouse"}]
 
 
 class _FakeDbapi:

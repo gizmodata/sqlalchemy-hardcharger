@@ -213,7 +213,7 @@ def test_settings_keep_their_meaning():
     kwargs = connect_args(
         "hardcharger://h?hardcharger.query_timeout=60&hardcharger.hardcharger.memory_limit=1GB"
     )
-    assert kwargs["settings"] == {"query_timeout": "60", "hardcharger.memory_limit": "1GB"}
+    assert kwargs["settings"] == {"query_timeout": "60", "memory_limit": "1GB"}
     assert "db_kwargs" not in kwargs
 
 

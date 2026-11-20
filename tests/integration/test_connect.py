@@ -186,9 +186,14 @@ def test_driver_connection_is_the_drivers_own(engine):
 
 
 def test_tls_with_the_servers_certificate_trusted(tls_server: hardcharger.Server, tls_files):
-    url = server_url(server=tls_server, tls_root_certs=tls_files["cert"])
+    url = server_url(server=tls_server)
     assert "tls" not in url.query
-    assert scalar(url=url, sql="SELECT 7") == 7
+    engine = create_engine(url=url, connect_args={"tls_root_certs": tls_files["cert"]})
+    try:
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT 7")).scalar() == 7
+    finally:
+        engine.dispose()
 
 
 def test_tls_refuses_a_certificate_it_was_not_told_to_trust(tls_server: hardcharger.Server):
