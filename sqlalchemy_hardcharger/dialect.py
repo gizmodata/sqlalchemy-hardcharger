@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import re
 import uuid
+import warnings
 from typing import Any
 
+from adbc_driver_hardcharger import DatabaseOptions, StatementOptions
 from sqlalchemy import exc, pool, schema, text, util
 from sqlalchemy import types as sqltypes
 from sqlalchemy.dialects import postgresql
@@ -80,22 +82,57 @@ _TRANSACTION_CONTROL = re.compile(
     flags=re.IGNORECASE | re.DOTALL,
 )
 
-# Driver options a URL may set. Everything else under adbc.* is refused in a URL, because a URL
-# is often configuration that someone else supplies, and other driver options name programs to
-# run (the browser command) or sessions and tokens to adopt. They remain available to the
-# application's own code through create_engine(connect_args={"db_kwargs": {...}}).
+# Driver options a URL may set, by their exact names: only ones that tune statements and
+# transfers. Every other driver option is refused in a URL, under any spelling (hardcharger.*,
+# chargewire.*, adbc.*), because a URL is often configuration that someone else supplies, and
+# other driver options name programs to run (the browser command), files to read, or sessions
+# and tokens to adopt. They remain available to the application's own code through
+# create_engine(connect_args={"db_kwargs": {...}}).
 _ADBC_URL_OPTIONS = (
-    "adbc.chargewire.statement.async",
-    "adbc.chargewire.statement.retain_result",
-    "adbc.chargewire.statement.timeout_seconds",
-    "adbc.chargewire.statement.result_partitions",
-    "adbc.chargewire.statement.result_order",
-    "adbc.chargewire.ipc_compression",
-    "adbc.chargewire.ingest.parts",
-    "adbc.hardcharger.ingest.parts",
-    "adbc.chargewire.retry.max_attempts",
-    "adbc.chargewire.session.reconnect",
+    StatementOptions.ASYNC.value,
+    StatementOptions.RETAIN_RESULT.value,
+    StatementOptions.TIMEOUT_SECONDS.value,
+    StatementOptions.RESULT_PARTITIONS.value,
+    StatementOptions.RESULT_ORDER.value,
+    StatementOptions.IPC_COMPRESSION.value,
+    StatementOptions.INGEST_PARTS.value,
+    DatabaseOptions.RETRY_MAX_ATTEMPTS.value,
+    DatabaseOptions.SESSION_RECONNECT.value,
 )
+
+# The names those options had before adbc-driver-hardcharger 2.7.0 (the ADBC driver style
+# guide's renaming): a URL may still use them, and the dialect hands the driver the current
+# name. Nothing else under the old names is accepted in a URL.
+_ADBC_URL_OPTIONS_RENAMED = {
+    "adbc.chargewire.statement.async": StatementOptions.ASYNC.value,
+    "adbc.chargewire.statement.retain_result": StatementOptions.RETAIN_RESULT.value,
+    "adbc.chargewire.statement.timeout_seconds": StatementOptions.TIMEOUT_SECONDS.value,
+    "adbc.chargewire.statement.result_partitions": StatementOptions.RESULT_PARTITIONS.value,
+    "adbc.chargewire.statement.result_order": StatementOptions.RESULT_ORDER.value,
+    "adbc.chargewire.ipc_compression": StatementOptions.IPC_COMPRESSION.value,
+    "adbc.chargewire.ingest.parts": StatementOptions.INGEST_PARTS.value,
+    "adbc.hardcharger.ingest.parts": StatementOptions.INGEST_PARTS.value,
+    "adbc.chargewire.retry.max_attempts": DatabaseOptions.RETRY_MAX_ATTEMPTS.value,
+    "adbc.chargewire.session.reconnect": DatabaseOptions.SESSION_RECONNECT.value,
+}
+
+
+def _spellings(option: str) -> frozenset[str]:
+    """Every name adbc-driver-hardcharger 2.7.0 reads one of the URL's driver options under."""
+    rest = option[len("hardcharger.") :]
+    names = {option, "chargewire." + rest, "adbc.chargewire." + rest, "adbc.warp." + rest}
+    for old, current in _ADBC_URL_OPTIONS_RENAMED.items():
+        if current == option:
+            names.add(old)
+            if old.startswith("adbc.chargewire."):
+                names.add("adbc.warp." + old[len("adbc.chargewire.") :])
+    return frozenset(names)
+
+
+_URL_OPTION_SPELLINGS = {option: _spellings(option=option) for option in _ADBC_URL_OPTIONS}
+
+# Prefixes under which a URL key names a driver option (refused unless allowlisted above).
+_DRIVER_OPTION_PREFIXES = ("adbc.", "chargewire.")
 
 # A temporary table or view hides a permanent one of the same name, in reflection as in a query:
 # when the session has a temporary object called :hc_table, only its rows are the answer.
@@ -121,15 +158,6 @@ def _as_bool(name: str, value: str) -> bool:
     raise exc.ArgumentError(f"URL option {name!r} must be true or false")
 
 
-def _as_bool_or_text(name: str, value: str) -> Any:
-    lowered = value.strip().lower()
-    if lowered in _TRUE:
-        return True
-    if lowered in _FALSE:
-        return False
-    return value
-
-
 def _as_float(name: str, value: str) -> float:
     try:
         return float(value)
@@ -141,24 +169,62 @@ def _as_text(name: str, value: str) -> str:
     return value
 
 
-# URL query option -> (connect() keyword, converter)
+def _setting_name(name: str) -> str:
+    """The setting a ``hardcharger.X`` URL key names (the driver also takes
+    ``hardcharger.hardcharger.X``)."""
+    setting = name[len("hardcharger.") :]
+    return setting[len("hardcharger.") :] if setting.startswith("hardcharger.") else setting
+
+
+def _names_driver_option(name: str) -> bool:
+    """Whether a ``hardcharger.X`` URL key names a driver option rather than a session setting.
+
+    A setting's name has no dot (``hardcharger.query_timeout``; the driver also takes
+    ``hardcharger.hardcharger.query_timeout``), while every driver option under ``hardcharger.``
+    has one (``hardcharger.oauth.browser``, ``hardcharger.setting.query_timeout``), so a dotted
+    name is a driver option and is never sent as a setting.
+    """
+    setting = name[len("hardcharger.") :]
+    if setting.startswith("hardcharger."):
+        setting = setting[len("hardcharger.") :]
+    return "." in setting
+
+
+def _as_false(name: str, value: str) -> bool:
+    if value.strip().lower() not in _FALSE:
+        raise exc.ArgumentError(
+            f"URL option {name!r} can only be false in a URL: sharing a sign-in is for "
+            f'create_engine(url, connect_args={{"{name}": ...}})'
+        )
+    return False
+
+
+# URL query option -> (connect() keyword, converter). A URL is often configuration that someone
+# other than the application's author supplies, so it sets only these: nothing that names a
+# program, a file or connection profile on this machine, a session to adopt, or a sign-in to
+# share.
 _URL_OPTIONS: dict[str, tuple[str, Any]] = {
-    "profile": ("profile", _as_text),
     "auth_type": ("auth_type", _as_text),
     "access_token": ("access_token", _as_text),
     "subject_token": ("subject_token", _as_text),
     "oauth_timeout": ("oauth_timeout", _as_float),
     "open_browser": ("open_browser", _as_bool),
-    "share_sign_in": ("share_sign_in", _as_bool_or_text),
+    "share_sign_in": ("share_sign_in", _as_false),
     "resume_timeout": ("resume_timeout", _as_float),
     "session_tag": ("session_tag", _as_text),
     "query_tag": ("query_tag", _as_text),
     "tls_skip_verify": ("tls_skip_verify", _as_bool),
-    "tls_root_certs": ("tls_root_certs", _as_text),
-    "tls_client_cert": ("tls_client_cert", _as_text),
-    "tls_client_key": ("tls_client_key", _as_text),
     "tls_server_name": ("tls_server_name", _as_text),
     "schema": ("db_schema", _as_text),
+}
+
+# connect() keywords a URL can't set, and why: each reads something on the machine that runs
+# the application, whoever wrote the URL. They remain create_engine(connect_args={...}).
+_CODE_ONLY_OPTIONS = {
+    "profile": "it loads a connection profile from this machine, with the credentials in it",
+    "tls_root_certs": "it reads a file on this machine",
+    "tls_client_cert": "it reads a file on this machine",
+    "tls_client_key": "it reads a file on this machine",
 }
 
 
@@ -735,11 +801,15 @@ class HardchargerDialect(PGDialect):
 
         TLS is on unless ``?tls=false``. The path names the catalog to make current, and
         ``?schema=`` the schema. The other options are ``connect()`` keywords of the Hardcharger
-        ADBC driver (``auth_type``, ``access_token``, ``tls_skip_verify``, ``tls_root_certs``,
-        ...); ``hardcharger.<name>`` is a session setting, and a few ``adbc.<...>`` driver
-        options that tune statements are accepted. Anything else is refused, never dropped: in
-        particular nothing in a URL can name a program to run. ``connect_args`` takes everything
-        the driver's ``connect()`` does.
+        ADBC driver (``auth_type``, ``access_token``, ``tls_skip_verify``, ...: the keys of
+        ``_URL_OPTIONS``); ``hardcharger.<name>`` (a name without a dot) is a session setting,
+        and a few driver options that tune statements are accepted by their exact names
+        (``hardcharger.query.result_partitions``, ...; their names from before
+        adbc-driver-hardcharger 2.7.0 too, ``adbc.chargewire.statement.result_partitions``, ...).
+        Anything else is refused, never dropped: nothing in a URL can name a program to run, a
+        file or connection profile on this machine, a session to adopt or a sign-in to share.
+        ``connect_args`` takes everything the driver's ``connect()`` does, and its ``db_kwargs``
+        and ``settings`` are merged with the URL's (``connect_args`` wins for an option in both).
         """
         kwargs: dict[str, Any] = {}
         query: dict[str, str] = {}
@@ -749,7 +819,6 @@ class HardchargerDialect(PGDialect):
             query[name] = value
 
         tls = _as_bool(name="tls", value=query.pop("tls")) if "tls" in query else True
-        profile = query.get("profile")
         if url.host:
             host = f"[{url.host}]" if ":" in url.host else url.host
             uri = f"hardcharger://{host}"
@@ -758,11 +827,7 @@ class HardchargerDialect(PGDialect):
             if not tls:
                 uri += "?tls=false"
             kwargs["uri"] = uri
-        elif not profile:
-            raise exc.ArgumentError(
-                "a hardcharger:// URL needs a host (hardcharger://user:password@host:31337) or "
-                "?profile=<ADBC connection profile>"
-            )
+        # (without a host, connect() needs a connection profile from connect_args)
         if url.username is not None:
             kwargs["username"] = url.username
         if url.password is not None:
@@ -772,7 +837,11 @@ class HardchargerDialect(PGDialect):
 
         settings: dict[str, str] = {}
         db_kwargs: dict[str, str] = {}
+        given_as: dict[str, str] = {}
         for name, value in query.items():
+            # The order matters: the driver's option names share the hardcharger. prefix with
+            # session settings, so the allowlisted option names are matched (exactly) first,
+            # and every other dotted hardcharger.X is refused, never taken for a setting.
             if name == "catalog":
                 if kwargs.get("catalog", value) != value:
                     raise exc.ArgumentError(
@@ -782,11 +851,35 @@ class HardchargerDialect(PGDialect):
             elif name in _URL_OPTIONS:
                 keyword, convert = _URL_OPTIONS[name]
                 kwargs[keyword] = convert(name, value)
-            elif name.startswith("hardcharger."):
-                settings[name[len("hardcharger.") :]] = value
-            elif name in _ADBC_URL_OPTIONS:
-                db_kwargs[name] = value
-            elif name.startswith("adbc."):
+            elif name in _CODE_ONLY_OPTIONS:
+                raise exc.ArgumentError(
+                    f"the option {name!r} can't be set in a URL ({_CODE_ONLY_OPTIONS[name]}): "
+                    f'pass it in create_engine(url, connect_args={{"{name}": ...}})'
+                )
+            elif name in _ADBC_URL_OPTIONS or name in _ADBC_URL_OPTIONS_RENAMED:
+                option = _ADBC_URL_OPTIONS_RENAMED.get(name, name)
+                if option in given_as:
+                    raise exc.ArgumentError(
+                        f"the URL sets the driver option {option!r} twice, as "
+                        f"{given_as[option]!r} and {name!r}: give it once"
+                    )
+                if option != name:
+                    warnings.warn(
+                        f"the URL option {name!r} is deprecated; use {option!r}",
+                        category=DeprecationWarning,
+                        stacklevel=2,
+                    )
+                given_as[option] = name
+                db_kwargs[option] = value
+            elif name.startswith("hardcharger.") and not _names_driver_option(name=name):
+                setting = _setting_name(name=name)
+                if settings.get(setting, value) != value:
+                    raise exc.ArgumentError(
+                        f"the URL sets the session setting {setting!r} twice, with different "
+                        "values: give it once"
+                    )
+                settings[setting] = value
+            elif name.startswith("hardcharger.") or name.startswith(_DRIVER_OPTION_PREFIXES):
                 raise exc.ArgumentError(
                     f"the driver option {name!r} can't be set in a URL: pass it in "
                     'create_engine(url, connect_args={"db_kwargs": {...}}). In a URL: '
@@ -802,9 +895,36 @@ class HardchargerDialect(PGDialect):
             kwargs["settings"] = settings
         if db_kwargs:
             kwargs["db_kwargs"] = db_kwargs
+        # What the URL set, so that connect() can merge connect_args' db_kwargs and settings with
+        # it: SQLAlchemy puts connect_args over these keyword arguments whole.
+        self._url_db_kwargs = db_kwargs
+        self._url_settings = settings
         return [], kwargs
 
     def connect(self, *cargs: Any, **cparams: Any) -> Any:
+        if "uri" not in cparams and "profile" not in cparams:
+            raise exc.ArgumentError(
+                "a hardcharger:// URL needs a host (hardcharger://user:password@host:31337), or "
+                'a connection profile in create_engine(url, connect_args={"profile": ...})'
+            )
+        # connect_args' db_kwargs and settings replace the URL's whole (SQLAlchemy updates the
+        # keyword arguments with connect_args): put the URL's back under them, connect_args
+        # winning for an option both give, under whatever name it gives it.
+        url_db_kwargs = getattr(self, "_url_db_kwargs", None)
+        if url_db_kwargs and cparams.get("db_kwargs") is not url_db_kwargs:
+            code = dict(cparams.get("db_kwargs") or {})
+            merged = {
+                option: value
+                for option, value in url_db_kwargs.items()
+                if not _URL_OPTION_SPELLINGS[option].intersection(code)
+            }
+            cparams["db_kwargs"] = {**merged, **code}
+        url_settings = getattr(self, "_url_settings", None)
+        if url_settings and cparams.get("settings") is not url_settings:
+            code = dict(cparams.get("settings") or {})
+            named = {_setting_name(name="hardcharger." + str(name)) for name in code}
+            merged = {name: value for name, value in url_settings.items() if name not in named}
+            cparams["settings"] = {**merged, **code}
         if cparams.get("auth_type") == "external":
             # One browser sign-in for this engine's pool, not one window per pooled connection.
             cparams.setdefault("share_sign_in", self._sign_in_scope)
