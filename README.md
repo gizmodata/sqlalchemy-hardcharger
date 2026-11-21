@@ -39,7 +39,7 @@ pip install sqlalchemy-hardcharger
 ```
 
 Python **3.10 or later**, SQLAlchemy **2.0 or 2.1** (SQLAlchemy 2.1 itself needs Python 3.11, so
-Python 3.10 gets 2.0). Installs `adbc-driver-hardcharger>=2.5.0,<3`.
+Python 3.10 gets 2.0). Installs `adbc-driver-hardcharger>=2.7.0,<3`.
 
 ## Quick start
 
@@ -189,28 +189,55 @@ hardcharger://<user>:<password>@<host>[:<port>][/<catalog>][?option=value&...]
 | `schema=` | `main` | Schema to make current |
 | `tls=` | `true` | `false`: plain HTTP, for a local development server |
 | `tls_skip_verify=` | `false` | `true`: don't verify the server's certificate (development only) |
-| `tls_root_certs=` | system trust store | CA certificates to trust: a PEM file path |
-| `tls_client_cert=`, `tls_client_key=` | | Client certificate and key for mutual TLS (PEM file paths) |
 | `tls_server_name=` | the host | Name to check the certificate against, when connecting by IP or through a tunnel |
 | `auth_type=` | `password` | `external`: sign in through a browser (SSO). `client_certificate`: sign in with the TLS client certificate |
 | `access_token=` | | A Hardcharger access token, in place of a user and password (see the note on tokens below) |
 | `subject_token=` | | An identity provider's token, exchanged for an access token |
 | `oauth_timeout=` | `300` | Seconds to wait for the browser sign-in |
 | `open_browser=` | `true` | `false`: print the sign-in URL instead of opening a browser |
-| `share_sign_in=` | per engine, with `auth_type=external` | `false`: one browser sign-in per connection. A name: share the sign-in with other engines given the same name |
+| `share_sign_in=false` | per engine, with `auth_type=external` | One browser sign-in per connection. Only `false` in a URL: sharing a sign-in with other engines (`true` or a name) is for `connect_args` |
 | `resume_timeout=` | `600` | Seconds to wait for a stopped GizmoData Cloud cluster to start |
 | `session_tag=`, `query_tag=` | | JSON objects recorded with the session and its statements |
-| `hardcharger.<name>=` | | A session setting, e.g. `hardcharger.query_timeout=60` |
-| `adbc.chargewire.statement.*`, `adbc.chargewire.ipc_compression`, `adbc.chargewire.ingest.parts`, `adbc.chargewire.retry.max_attempts`, `adbc.chargewire.session.reconnect` | | Driver options that tune statements |
+| `hardcharger.<name>=` | | A session setting (a name without a dot), e.g. `hardcharger.query_timeout=60` |
+| `hardcharger.query.async`, `hardcharger.query.retain_result`, `hardcharger.query.timeout_seconds`, `hardcharger.query.result_partitions`, `hardcharger.query.result_order`, `hardcharger.ipc.compression`, `hardcharger.ingest.parts`, `hardcharger.retry.max_attempts`, `hardcharger.session.reconnect` | | Driver options that tune statements, by these exact names. Their names from before adbc-driver-hardcharger 2.7.0 (`adbc.chargewire.statement.result_partitions`, ...) still work, with a `DeprecationWarning` |
 
 An option the dialect doesn't know is an error, never ignored. Everything `connect()` of the driver
 takes can be passed as `create_engine(url, connect_args={...})`: see the
 [driver's Python documentation](https://docs.hardcharger.gizmodata.com/clients/python/).
+`connect_args`' `db_kwargs` and `settings` are merged with the URL's, `connect_args` winning for an
+option or setting both give (under any of the option's names). A URL that gives one session setting
+twice with different values (`hardcharger.query_timeout=` and `hardcharger.hardcharger.query_timeout=`)
+is refused.
 
-A URL is often configuration that someone other than the application's author supplies, so a URL
-can only choose among the options above: it can't name a program to run (the driver's browser
-command), adopt another session, or set a driver option outside that list. Those are for
-`connect_args`, in the application's own code.
+A URL is often configuration that someone other than the application's author supplies (a BI tool's
+connection form, a pipeline's settings), and the application acts on it on its own machine. So a URL
+sets exactly the options in the table above and nothing else. In particular these are for
+`connect_args`, in the application's own code, and refused in a URL:
+
+- `profile`: an ADBC connection profile on this machine, with the credentials stored in it (a URL
+  without a host takes its profile from `connect_args`: `create_engine("hardcharger://",
+  connect_args={"profile": "prod"})`);
+- `tls_root_certs`, `tls_client_cert`, `tls_client_key`: files on this machine (CA certificates, the
+  machine's own client certificate and key);
+- `share_sign_in=true` or a name: joining a browser sign-in other engines share;
+- `open_browser=<command>`: a program to run (a URL takes only `true` or `false`);
+- every other driver option, under any spelling (`hardcharger.*`, `chargewire.*` or the older
+  `adbc.*`): the session id, the browser command, sign-in keys and the rest (a URL takes a token
+  only as `access_token=` or `subject_token=`, its author's own credential).
+
+<!-- not-run: needs a server with mutual TLS -->
+```python
+from sqlalchemy import create_engine
+
+engine = create_engine(
+    "hardcharger://db.example.com?auth_type=client_certificate",
+    connect_args={
+        "tls_root_certs": "/etc/hardcharger/ca.pem",
+        "tls_client_cert": "/etc/hardcharger/client.pem",
+        "tls_client_key": "/etc/hardcharger/client.key",
+    },
+)
+```
 
 **Tokens.** SQLAlchemy hides a URL's password when it prints an engine or a URL, and nothing else:
 an `access_token=` or `subject_token=` in the URL shows in `repr(engine)` and in logs that print

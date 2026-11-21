@@ -6,6 +6,57 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-20
+
+### Security
+
+- **A URL can no longer load this machine's connection profile.** `?profile=` is refused: a URL
+  naming its own host and the machine's profile (`hardcharger://other-host/?profile=prod`) had
+  the driver send the profile's stored user name and password to that host, and
+  `hardcharger:///?profile=prod` signed in as the profile's user. A profile is
+  `connect_args={"profile": ...}` now, with a host-less URL: `create_engine("hardcharger://",
+  connect_args={"profile": "prod"})`.
+- **A URL can no longer name files on this machine.** `?tls_root_certs=`, `?tls_client_cert=` and
+  `?tls_client_key=` are refused: with them a URL that held no secret signed in with the
+  machine's own client certificate. They are `connect_args` now.
+- **A URL can no longer join a shared browser sign-in.** `?share_sign_in=` takes only `false`:
+  `true` joined the process's unnamed shared sign-in, and a name another engine's. Sharing is
+  `connect_args={"share_sign_in": ...}`.
+- Every other driver option stays out of a URL under every spelling the 2.7.0 driver reads
+  (`hardcharger.*`, `chargewire.*`, `adbc.hardcharger.*`, `adbc.chargewire.*`, `adbc.warp.*`):
+  the browser command, the session id, sign-in keys and the rest. A dotted `hardcharger.X` URL
+  key is never taken for a session setting (setting names have no dot), so
+  `?hardcharger.oauth.browser=` is refused by the dialect instead of reaching the driver.
+- What a URL may set, exactly: the host, port, user, password, catalog (path or `catalog=`) and
+  `tls`; the `connect()` keywords `schema`, `auth_type`, `access_token`, `subject_token`,
+  `oauth_timeout`, `open_browser` (true or false), `share_sign_in` (false), `resume_timeout`,
+  `session_tag`, `query_tag`, `tls_skip_verify` and `tls_server_name`; `hardcharger.<setting>`
+  session settings; and the driver options listed under Changed. Refusals name the option, never
+  the value given. Tests sweep every option name the driver knows, prove each refused case
+  against a real server (a stand-in server checks that a profile's credentials never reach a
+  URL's host), and check that passwords with `;)"'@:/%`, spaces, backslashes and non-ASCII
+  characters sign in and never appear in an error.
+
+### Changed
+
+- **Breaking for URLs that used `profile=`, `tls_root_certs=`, `tls_client_cert=`,
+  `tls_client_key=` or `share_sign_in=true|<name>`** (see Security): move them to
+  `connect_args`. dlt-hardcharger's `hardcharger://?profile=...` credentials are among them.
+- Requires `adbc-driver-hardcharger` 2.7.0 or newer (was 2.5.0), whose option names follow the
+  ADBC driver style guide (`hardcharger.*` instead of `adbc.chargewire.*`/`adbc.hardcharger.*`).
+  The driver options a URL may set are now `hardcharger.query.async`,
+  `hardcharger.query.retain_result`, `hardcharger.query.timeout_seconds`,
+  `hardcharger.query.result_partitions`, `hardcharger.query.result_order`,
+  `hardcharger.ipc.compression`, `hardcharger.ingest.parts`, `hardcharger.retry.max_attempts` and
+  `hardcharger.session.reconnect`. Their old names still work in a URL: the dialect hands the
+  driver the new name (so the driver prints no deprecation line) and raises a
+  `DeprecationWarning`. A URL that gives one option under two names is refused.
+- `connect_args`' `db_kwargs` and `settings` are merged with the URL's, `connect_args` winning for
+  an option or setting both give (under any name of the option); before, they replaced the URL's
+  whole. A URL that gives one session setting twice with different values
+  (`hardcharger.query_timeout=1&hardcharger.hardcharger.query_timeout=2`) is refused; before, the
+  first one won.
+
 ## [1.1.0] - 2026-11-13
 
 ### Added

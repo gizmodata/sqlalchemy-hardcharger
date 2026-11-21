@@ -36,7 +36,7 @@ dependencies = [
     "sqlalchemy>=2.0.57,<2.2",
     # 2.5.0 applies a catalog and a schema given together at connect in that order (earlier
     # releases usually applied the schema first), and is the first to install on Python 3.10.
-    "adbc-driver-hardcharger>=2.5.0,<3",
+    "adbc-driver-hardcharger>=2.7.0,<3",
 ]
 
 [project.optional-dependencies]
